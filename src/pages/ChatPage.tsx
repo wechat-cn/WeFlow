@@ -3540,13 +3540,12 @@ function MessageBubble({
   const requestVideoInfo = useCallback(async () => {
     if (!videoMd5 || videoLoadingRef.current) return
 
-    videoLoadingRef.current = true
-    setVideoLoading(true)
-    try {
-      const result = await window.electronAPI.video.getVideoInfo(videoMd5)
-      if (result && result.success && result.exists) {
-        setVideoInfo({
-          exists: result.exists,
+        videoLoadingRef.current = true
+        setVideoLoading(true)
+        try {
+          const result = await window.electronAPI.video.getVideoInfo(videoMd5)
+          if (result && result.success && result.exists) {        
+            setVideoInfo({          exists: result.exists,
           videoUrl: result.videoUrl,
           coverUrl: result.coverUrl,
           thumbUrl: result.thumbUrl
