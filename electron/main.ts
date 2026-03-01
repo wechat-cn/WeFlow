@@ -1032,6 +1032,10 @@ function registerIpcHandlers() {
     return snsService.getExportStats()
   })
 
+  ipcMain.handle('sns:getExportStatsFast', async () => {
+    return snsService.getExportStatsFast()
+  })
+
   ipcMain.handle('sns:debugResource', async (_, url: string) => {
     return snsService.debugResource(url)
   })

@@ -237,13 +237,15 @@ const timestampOrDash = (timestamp?: number): string => {
 }
 
 const createTaskId = (): string => `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-const MESSAGE_COUNT_VIEWPORT_PREFETCH = 220
-const MESSAGE_COUNT_BACKGROUND_BATCH = 180
-const MESSAGE_COUNT_BACKGROUND_INTERVAL_MS = 100
+const MESSAGE_COUNT_VIEWPORT_PREFETCH = 120
+const MESSAGE_COUNT_BACKGROUND_BATCH = 90
+const MESSAGE_COUNT_BACKGROUND_INTERVAL_MS = 90
 const METRICS_VIEWPORT_PREFETCH = 90
 const METRICS_BACKGROUND_BATCH = 40
 const METRICS_BACKGROUND_INTERVAL_MS = 220
 const CONTACT_ENRICH_TIMEOUT_MS = 7000
+const EXPORT_SESSION_COUNT_CACHE_STALE_MS = 48 * 60 * 60 * 1000
+const EXPORT_SNS_STATS_CACHE_STALE_MS = 12 * 60 * 60 * 1000
 
 const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number): Promise<T | null> => {
   let timer: ReturnType<typeof setTimeout> | null = null
@@ -371,11 +373,13 @@ function ExportPage() {
     totalPosts: 0,
     totalFriends: 0
   })
+  const [hasSeededSnsStats, setHasSeededSnsStats] = useState(false)
   const [nowTick, setNowTick] = useState(Date.now())
 
   const progressUnsubscribeRef = useRef<(() => void) | null>(null)
   const runningTaskIdRef = useRef<string | null>(null)
   const tasksRef = useRef<ExportTask[]>([])
+  const hasSeededSnsStatsRef = useRef(false)
   const sessionMessageCountsRef = useRef<Record<string, number>>({})
   const sessionMetricsRef = useRef<Record<string, SessionMetrics>>({})
   const sessionLoadTokenRef = useRef(0)
@@ -383,10 +387,17 @@ function ExportPage() {
   const loadingMetricsRef = useRef<Set<string>>(new Set())
   const preselectAppliedRef = useRef(false)
   const visibleSessionsRef = useRef<SessionRow[]>([])
+  const exportCacheScopeRef = useRef('default')
+  const exportCacheScopeReadyRef = useRef(false)
+  const persistSessionCountTimerRef = useRef<number | null>(null)
 
   useEffect(() => {
     tasksRef.current = tasks
   }, [tasks])
+
+  useEffect(() => {
+    hasSeededSnsStatsRef.current = hasSeededSnsStats
+  }, [hasSeededSnsStats])
 
   useEffect(() => {
     sessionMessageCountsRef.current = sessionMessageCounts
@@ -395,6 +406,30 @@ function ExportPage() {
   useEffect(() => {
     sessionMetricsRef.current = sessionMetrics
   }, [sessionMetrics])
+
+  useEffect(() => {
+    if (persistSessionCountTimerRef.current) {
+      window.clearTimeout(persistSessionCountTimerRef.current)
+      persistSessionCountTimerRef.current = null
+    }
+
+    if (isBaseConfigLoading || !exportCacheScopeReadyRef.current) return
+
+    const countSize = Object.keys(sessionMessageCounts).length
+    if (countSize === 0) return
+
+    persistSessionCountTimerRef.current = window.setTimeout(() => {
+      void configService.setExportSessionMessageCountCache(exportCacheScopeRef.current, sessionMessageCounts)
+      persistSessionCountTimerRef.current = null
+    }, 900)
+
+    return () => {
+      if (persistSessionCountTimerRef.current) {
+        window.clearTimeout(persistSessionCountTimerRef.current)
+        persistSessionCountTimerRef.current = null
+      }
+    }
+  }, [sessionMessageCounts, isBaseConfigLoading])
 
   const preselectSessionIds = useMemo(() => {
     const state = location.state as { preselectSessionIds?: unknown; preselectSessionId?: unknown } | null
@@ -416,7 +451,7 @@ function ExportPage() {
   const loadBaseConfig = useCallback(async () => {
     setIsBaseConfigLoading(true)
     try {
-      const [savedPath, savedFormat, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedWriteLayout, savedSessionMap, savedContentMap, savedSnsPostCount] = await Promise.all([
+      const [savedPath, savedFormat, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedWriteLayout, savedSessionMap, savedContentMap, savedSnsPostCount, myWxid, dbPath] = await Promise.all([
         configService.getExportPath(),
         configService.getExportDefaultFormat(),
         configService.getExportDefaultMedia(),
@@ -427,7 +462,17 @@ function ExportPage() {
         configService.getExportWriteLayout(),
         configService.getExportLastSessionRunMap(),
         configService.getExportLastContentRunMap(),
-        configService.getExportLastSnsPostCount()
+        configService.getExportLastSnsPostCount(),
+        configService.getMyWxid(),
+        configService.getDbPath()
+      ])
+      const exportCacheScope = `${dbPath || ''}::${myWxid || ''}` || 'default'
+      exportCacheScopeRef.current = exportCacheScope
+      exportCacheScopeReadyRef.current = true
+
+      const [cachedSessionCountMap, cachedSnsStats] = await Promise.all([
+        configService.getExportSessionMessageCountCache(exportCacheScope),
+        configService.getExportSnsStatsCache(exportCacheScope)
       ])
 
       if (savedPath) {
@@ -441,6 +486,19 @@ function ExportPage() {
       setLastExportBySession(savedSessionMap)
       setLastExportByContent(savedContentMap)
       setLastSnsExportPostCount(savedSnsPostCount)
+
+      if (cachedSessionCountMap && Date.now() - cachedSessionCountMap.updatedAt <= EXPORT_SESSION_COUNT_CACHE_STALE_MS) {
+        setSessionMessageCounts(cachedSessionCountMap.counts || {})
+      }
+
+      if (cachedSnsStats && Date.now() - cachedSnsStats.updatedAt <= EXPORT_SNS_STATS_CACHE_STALE_MS) {
+        setSnsStats({
+          totalPosts: cachedSnsStats.totalPosts || 0,
+          totalFriends: cachedSnsStats.totalFriends || 0
+        })
+        hasSeededSnsStatsRef.current = true
+        setHasSeededSnsStats(true)
+      }
 
       const txtColumns = savedTxtColumns && savedTxtColumns.length > 0 ? savedTxtColumns : defaultTxtColumns
       setOptions(prev => ({
@@ -473,20 +531,52 @@ function ExportPage() {
     }
   }, [])
 
-  const loadSnsStats = useCallback(async () => {
-    setIsSnsStatsLoading(true)
+  const loadSnsStats = useCallback(async (options?: { full?: boolean; silent?: boolean }) => {
+    if (!options?.silent) {
+      setIsSnsStatsLoading(true)
+    }
+
+    const applyStats = async (next: { totalPosts: number; totalFriends: number } | null) => {
+      if (!next) return
+      const normalized = {
+        totalPosts: Number.isFinite(next.totalPosts) ? Math.max(0, Math.floor(next.totalPosts)) : 0,
+        totalFriends: Number.isFinite(next.totalFriends) ? Math.max(0, Math.floor(next.totalFriends)) : 0
+      }
+      setSnsStats(normalized)
+      hasSeededSnsStatsRef.current = true
+      setHasSeededSnsStats(true)
+      if (exportCacheScopeReadyRef.current) {
+        await configService.setExportSnsStatsCache(exportCacheScopeRef.current, normalized)
+      }
+    }
+
     try {
-      const result = await window.electronAPI.sns.getExportStats()
-      if (result.success && result.data) {
-        setSnsStats({
-          totalPosts: result.data.totalPosts || 0,
-          totalFriends: result.data.totalFriends || 0
-        })
+      const fastResult = await withTimeout(window.electronAPI.sns.getExportStatsFast(), 2200)
+      if (fastResult?.success && fastResult.data) {
+        const fastStats = {
+          totalPosts: fastResult.data.totalPosts || 0,
+          totalFriends: fastResult.data.totalFriends || 0
+        }
+        if (fastStats.totalPosts > 0 || hasSeededSnsStatsRef.current) {
+          await applyStats(fastStats)
+        }
+      }
+
+      if (options?.full) {
+        const result = await withTimeout(window.electronAPI.sns.getExportStats(), 9000)
+        if (result?.success && result.data) {
+          await applyStats({
+            totalPosts: result.data.totalPosts || 0,
+            totalFriends: result.data.totalFriends || 0
+          })
+        }
       }
     } catch (error) {
       console.error('加载朋友圈导出统计失败:', error)
     } finally {
-      setIsSnsStatsLoading(false)
+      if (!options?.silent) {
+        setIsSnsStatsLoading(false)
+      }
     }
   }, [])
 
@@ -497,9 +587,7 @@ function ExportPage() {
     setIsSessionEnriching(false)
     loadingMessageCountsRef.current.clear()
     loadingMetricsRef.current.clear()
-    sessionMessageCountsRef.current = {}
     sessionMetricsRef.current = {}
-    setSessionMessageCounts({})
     setSessionMetrics({})
 
     const isStale = () => sessionLoadTokenRef.current !== loadToken
@@ -530,6 +618,16 @@ function ExportPage() {
 
         if (isStale()) return
         setSessions(baseSessions)
+        setSessionMessageCounts(prev => {
+          const next: Record<string, number> = {}
+          for (const session of baseSessions) {
+            const count = prev[session.username]
+            if (typeof count === 'number') {
+              next[session.username] = count
+            }
+          }
+          return next
+        })
         setIsLoading(false)
 
         // 后台补齐联系人字段（昵称、头像、类型），不阻塞首屏会话列表渲染。
@@ -602,8 +700,8 @@ function ExportPage() {
 
     // 朋友圈统计延后一点加载，避免与首屏会话初始化抢占。
     const timer = window.setTimeout(() => {
-      void loadSnsStats()
-    }, 180)
+      void loadSnsStats({ full: true })
+    }, 120)
 
     return () => window.clearTimeout(timer)
   }, [loadTabCounts, loadBaseConfig, loadSessions, loadSnsStats])
@@ -666,40 +764,42 @@ function ExportPage() {
       session => currentCounts[session.username] === undefined && !loadingMessageCountsRef.current.has(session.username)
     )
     if (pending.length === 0) return
-
-    const updates: Record<string, number> = {}
     for (const session of pending) {
       loadingMessageCountsRef.current.add(session.username)
     }
 
     try {
-      const batchSize = 220
+      const batchSize = pending.length > 100 ? 48 : 28
       for (let i = 0; i < pending.length; i += batchSize) {
         if (loadTokenAtStart !== sessionLoadTokenRef.current) return
         const chunk = pending.slice(i, i + batchSize)
         const ids = chunk.map(session => session.username)
+        const chunkUpdates: Record<string, number> = {}
 
         try {
-          const result = await window.electronAPI.chat.getSessionMessageCounts(ids)
+          const result = await withTimeout(window.electronAPI.chat.getSessionMessageCounts(ids), 10000)
+          if (!result) {
+            continue
+          }
           for (const session of chunk) {
-            const value = result.success && result.counts ? result.counts[session.username] : undefined
-            updates[session.username] = typeof value === 'number' ? value : 0
+            const value = result?.success && result.counts ? result.counts[session.username] : undefined
+            chunkUpdates[session.username] = typeof value === 'number' ? value : 0
           }
         } catch (error) {
           console.error('加载会话总消息数失败:', error)
           for (const session of chunk) {
-            updates[session.username] = 0
+            chunkUpdates[session.username] = 0
           }
+        }
+
+        if (loadTokenAtStart === sessionLoadTokenRef.current && Object.keys(chunkUpdates).length > 0) {
+          setSessionMessageCounts(prev => ({ ...prev, ...chunkUpdates }))
         }
       }
     } finally {
       for (const session of pending) {
         loadingMessageCountsRef.current.delete(session.username)
       }
-    }
-
-    if (loadTokenAtStart === sessionLoadTokenRef.current && Object.keys(updates).length > 0) {
-      setSessionMessageCounts(prev => ({ ...prev, ...updates }))
     }
   }, [])
 
@@ -787,35 +887,43 @@ function ExportPage() {
 
   useEffect(() => {
     if (sessions.length === 0) return
+    const prioritySessions = [
+      ...sessions.filter(session => session.kind === activeTab),
+      ...sessions.filter(session => session.kind !== activeTab)
+    ]
     let cursor = 0
     const timer = window.setInterval(() => {
-      if (cursor >= sessions.length) {
+      if (cursor >= prioritySessions.length) {
         window.clearInterval(timer)
         return
       }
-      const chunk = sessions.slice(cursor, cursor + MESSAGE_COUNT_BACKGROUND_BATCH)
+      const chunk = prioritySessions.slice(cursor, cursor + MESSAGE_COUNT_BACKGROUND_BATCH)
       cursor += MESSAGE_COUNT_BACKGROUND_BATCH
       void ensureSessionMessageCounts(chunk)
     }, MESSAGE_COUNT_BACKGROUND_INTERVAL_MS)
 
     return () => window.clearInterval(timer)
-  }, [sessions, ensureSessionMessageCounts])
+  }, [sessions, activeTab, ensureSessionMessageCounts])
 
   useEffect(() => {
     if (sessions.length === 0) return
+    const prioritySessions = [
+      ...sessions.filter(session => session.kind === activeTab),
+      ...sessions.filter(session => session.kind !== activeTab)
+    ]
     let cursor = 0
     const timer = window.setInterval(() => {
-      if (cursor >= sessions.length) {
+      if (cursor >= prioritySessions.length) {
         window.clearInterval(timer)
         return
       }
-      const chunk = sessions.slice(cursor, cursor + METRICS_BACKGROUND_BATCH)
+      const chunk = prioritySessions.slice(cursor, cursor + METRICS_BACKGROUND_BATCH)
       cursor += METRICS_BACKGROUND_BATCH
       void ensureSessionMetrics(chunk)
     }, METRICS_BACKGROUND_INTERVAL_MS)
 
     return () => window.clearInterval(timer)
-  }, [sessions, ensureSessionMetrics])
+  }, [sessions, activeTab, ensureSessionMetrics])
 
   const selectedCount = selectedSessions.size
 
@@ -1059,7 +1167,7 @@ function ExportPage() {
           const mergedExportedCount = Math.max(lastSnsExportPostCount, exportedPosts)
           setLastSnsExportPostCount(mergedExportedCount)
           await configService.setExportLastSnsPostCount(mergedExportedCount)
-          await loadSnsStats()
+          await loadSnsStats({ full: true })
 
           updateTask(next.id, task => ({
             ...task,
@@ -1519,6 +1627,7 @@ function ExportPage() {
   const hasTabCountsSource = prefetchedTabCounts !== null || sessions.length > 0
   const isTabCountComputing = isTabCountsLoading && !hasTabCountsSource
   const isSessionCardStatsLoading = isLoading || isBaseConfigLoading
+  const isSnsCardStatsLoading = !hasSeededSnsStats
   const taskRunningCount = tasks.filter(task => task.status === 'running').length
   const taskQueuedCount = tasks.filter(task => task.status === 'queued').length
   const showInitialSkeleton = isLoading && sessions.length === 0
@@ -1574,7 +1683,7 @@ function ExportPage() {
         {contentCards.map(card => {
           const Icon = card.icon
           const isCardStatsLoading = card.type === 'sns'
-            ? (isSnsStatsLoading || isBaseConfigLoading)
+            ? isSnsCardStatsLoading
             : isSessionCardStatsLoading
           return (
             <div key={card.type} className="content-card">

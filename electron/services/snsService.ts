@@ -229,6 +229,10 @@ class SnsService {
     private configService: ConfigService
     private contactCache: ContactCacheService
     private imageCache = new Map<string, string>()
+    private exportStatsCache: { totalPosts: number; totalFriends: number; updatedAt: number } | null = null
+    private readonly exportStatsCacheTtlMs = 5 * 60 * 1000
+    private lastTimelineFallbackAt = 0
+    private readonly timelineFallbackCooldownMs = 3 * 60 * 1000
 
     constructor() {
         this.configService = new ConfigService()
@@ -403,38 +407,66 @@ class SnsService {
         return { success: true, usernames: result.rows.map((r: any) => r.user_name).filter(Boolean) }
     }
 
-    async getExportStats(): Promise<{ success: boolean; data?: { totalPosts: number; totalFriends: number }; error?: string }> {
-        try {
-            let totalPosts = 0
-            let totalFriends = 0
+    private async getExportStatsFromTableCount(): Promise<{ totalPosts: number; totalFriends: number }> {
+        let totalPosts = 0
+        let totalFriends = 0
 
-            const postCountResult = await wcdbService.execQuery('sns', null, 'SELECT COUNT(1) AS total FROM SnsTimeLine')
-            if (postCountResult.success && postCountResult.rows && postCountResult.rows.length > 0) {
-                totalPosts = this.parseCountValue(postCountResult.rows[0])
-            }
+        const postCountResult = await wcdbService.execQuery('sns', null, 'SELECT COUNT(1) AS total FROM SnsTimeLine')
+        if (postCountResult.success && postCountResult.rows && postCountResult.rows.length > 0) {
+            totalPosts = this.parseCountValue(postCountResult.rows[0])
+        }
 
-            if (totalPosts > 0) {
-                const friendCountPrimary = await wcdbService.execQuery(
+        if (totalPosts > 0) {
+            const friendCountPrimary = await wcdbService.execQuery(
+                'sns',
+                null,
+                "SELECT COUNT(DISTINCT user_name) AS total FROM SnsTimeLine WHERE user_name IS NOT NULL AND user_name <> ''"
+            )
+            if (friendCountPrimary.success && friendCountPrimary.rows && friendCountPrimary.rows.length > 0) {
+                totalFriends = this.parseCountValue(friendCountPrimary.rows[0])
+            } else {
+                const friendCountFallback = await wcdbService.execQuery(
                     'sns',
                     null,
-                    "SELECT COUNT(DISTINCT user_name) AS total FROM SnsTimeLine WHERE user_name IS NOT NULL AND user_name <> ''"
+                    "SELECT COUNT(DISTINCT userName) AS total FROM SnsTimeLine WHERE userName IS NOT NULL AND userName <> ''"
                 )
-                if (friendCountPrimary.success && friendCountPrimary.rows && friendCountPrimary.rows.length > 0) {
-                    totalFriends = this.parseCountValue(friendCountPrimary.rows[0])
-                } else {
-                    const friendCountFallback = await wcdbService.execQuery(
-                        'sns',
-                        null,
-                        "SELECT COUNT(DISTINCT userName) AS total FROM SnsTimeLine WHERE userName IS NOT NULL AND userName <> ''"
-                    )
-                    if (friendCountFallback.success && friendCountFallback.rows && friendCountFallback.rows.length > 0) {
-                        totalFriends = this.parseCountValue(friendCountFallback.rows[0])
+                if (friendCountFallback.success && friendCountFallback.rows && friendCountFallback.rows.length > 0) {
+                    totalFriends = this.parseCountValue(friendCountFallback.rows[0])
+                }
+            }
+        }
+
+        return { totalPosts, totalFriends }
+    }
+
+    async getExportStats(options?: {
+        allowTimelineFallback?: boolean
+        preferCache?: boolean
+    }): Promise<{ success: boolean; data?: { totalPosts: number; totalFriends: number }; error?: string }> {
+        const allowTimelineFallback = options?.allowTimelineFallback ?? true
+        const preferCache = options?.preferCache ?? false
+        const now = Date.now()
+
+        try {
+            if (preferCache && this.exportStatsCache && now - this.exportStatsCache.updatedAt <= this.exportStatsCacheTtlMs) {
+                return {
+                    success: true,
+                    data: {
+                        totalPosts: this.exportStatsCache.totalPosts,
+                        totalFriends: this.exportStatsCache.totalFriends
                     }
                 }
             }
 
-            // 某些环境下 SnsTimeLine 统计查询会返回 0，这里回退到与导出同源的 timeline 接口统计。
-            if (totalPosts <= 0 || totalFriends <= 0) {
+            let { totalPosts, totalFriends } = await this.getExportStatsFromTableCount()
+
+            // 某些环境下 SnsTimeLine 统计查询会返回 0，这里在允许时回退到与导出同源的 timeline 接口统计。
+            if (
+                allowTimelineFallback &&
+                (totalPosts <= 0 || totalFriends <= 0) &&
+                now - this.lastTimelineFallbackAt >= this.timelineFallbackCooldownMs
+            ) {
+                this.lastTimelineFallbackAt = now
                 const timelineStats = await this.getExportStatsFromTimeline()
                 if (timelineStats.totalPosts > 0) {
                     totalPosts = timelineStats.totalPosts
@@ -444,10 +476,32 @@ class SnsService {
                 }
             }
 
+            this.exportStatsCache = {
+                totalPosts,
+                totalFriends,
+                updatedAt: Date.now()
+            }
+
             return { success: true, data: { totalPosts, totalFriends } }
         } catch (e) {
+            if (this.exportStatsCache) {
+                return {
+                    success: true,
+                    data: {
+                        totalPosts: this.exportStatsCache.totalPosts,
+                        totalFriends: this.exportStatsCache.totalFriends
+                    }
+                }
+            }
             return { success: false, error: String(e) }
         }
+    }
+
+    async getExportStatsFast(): Promise<{ success: boolean; data?: { totalPosts: number; totalFriends: number }; error?: string }> {
+        return this.getExportStats({
+            allowTimelineFallback: false,
+            preferCache: true
+        })
     }
 
     // 安装朋友圈删除拦截

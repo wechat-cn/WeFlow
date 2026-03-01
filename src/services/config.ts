@@ -36,6 +36,8 @@ export const CONFIG_KEYS = {
   EXPORT_LAST_SESSION_RUN_MAP: 'exportLastSessionRunMap',
   EXPORT_LAST_CONTENT_RUN_MAP: 'exportLastContentRunMap',
   EXPORT_LAST_SNS_POST_COUNT: 'exportLastSnsPostCount',
+  EXPORT_SESSION_MESSAGE_COUNT_CACHE_MAP: 'exportSessionMessageCountCacheMap',
+  EXPORT_SNS_STATS_CACHE_MAP: 'exportSnsStatsCacheMap',
 
   // 安全
   AUTH_ENABLED: 'authEnabled',
@@ -447,6 +449,104 @@ export async function getExportLastSnsPostCount(): Promise<number> {
 export async function setExportLastSnsPostCount(count: number): Promise<void> {
   const normalized = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0
   await config.set(CONFIG_KEYS.EXPORT_LAST_SNS_POST_COUNT, normalized)
+}
+
+export interface ExportSessionMessageCountCacheItem {
+  updatedAt: number
+  counts: Record<string, number>
+}
+
+export interface ExportSnsStatsCacheItem {
+  updatedAt: number
+  totalPosts: number
+  totalFriends: number
+}
+
+export async function getExportSessionMessageCountCache(scopeKey: string): Promise<ExportSessionMessageCountCacheItem | null> {
+  if (!scopeKey) return null
+  const value = await config.get(CONFIG_KEYS.EXPORT_SESSION_MESSAGE_COUNT_CACHE_MAP)
+  if (!value || typeof value !== 'object') return null
+  const rawMap = value as Record<string, unknown>
+  const rawItem = rawMap[scopeKey]
+  if (!rawItem || typeof rawItem !== 'object') return null
+
+  const rawUpdatedAt = (rawItem as Record<string, unknown>).updatedAt
+  const rawCounts = (rawItem as Record<string, unknown>).counts
+  if (!rawCounts || typeof rawCounts !== 'object') return null
+
+  const counts: Record<string, number> = {}
+  for (const [sessionId, countRaw] of Object.entries(rawCounts as Record<string, unknown>)) {
+    if (typeof countRaw === 'number' && Number.isFinite(countRaw) && countRaw >= 0) {
+      counts[sessionId] = Math.floor(countRaw)
+    }
+  }
+
+  return {
+    updatedAt: typeof rawUpdatedAt === 'number' && Number.isFinite(rawUpdatedAt) ? rawUpdatedAt : 0,
+    counts
+  }
+}
+
+export async function setExportSessionMessageCountCache(scopeKey: string, counts: Record<string, number>): Promise<void> {
+  if (!scopeKey) return
+  const current = await config.get(CONFIG_KEYS.EXPORT_SESSION_MESSAGE_COUNT_CACHE_MAP)
+  const map = current && typeof current === 'object'
+    ? { ...(current as Record<string, unknown>) }
+    : {}
+
+  const normalized: Record<string, number> = {}
+  for (const [sessionId, countRaw] of Object.entries(counts || {})) {
+    if (typeof countRaw === 'number' && Number.isFinite(countRaw) && countRaw >= 0) {
+      normalized[sessionId] = Math.floor(countRaw)
+    }
+  }
+
+  map[scopeKey] = {
+    updatedAt: Date.now(),
+    counts: normalized
+  }
+  await config.set(CONFIG_KEYS.EXPORT_SESSION_MESSAGE_COUNT_CACHE_MAP, map)
+}
+
+export async function getExportSnsStatsCache(scopeKey: string): Promise<ExportSnsStatsCacheItem | null> {
+  if (!scopeKey) return null
+  const value = await config.get(CONFIG_KEYS.EXPORT_SNS_STATS_CACHE_MAP)
+  if (!value || typeof value !== 'object') return null
+  const rawMap = value as Record<string, unknown>
+  const rawItem = rawMap[scopeKey]
+  if (!rawItem || typeof rawItem !== 'object') return null
+
+  const raw = rawItem as Record<string, unknown>
+  const totalPosts = typeof raw.totalPosts === 'number' && Number.isFinite(raw.totalPosts) && raw.totalPosts >= 0
+    ? Math.floor(raw.totalPosts)
+    : 0
+  const totalFriends = typeof raw.totalFriends === 'number' && Number.isFinite(raw.totalFriends) && raw.totalFriends >= 0
+    ? Math.floor(raw.totalFriends)
+    : 0
+  const updatedAt = typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt)
+    ? raw.updatedAt
+    : 0
+
+  return { updatedAt, totalPosts, totalFriends }
+}
+
+export async function setExportSnsStatsCache(
+  scopeKey: string,
+  stats: { totalPosts: number; totalFriends: number }
+): Promise<void> {
+  if (!scopeKey) return
+  const current = await config.get(CONFIG_KEYS.EXPORT_SNS_STATS_CACHE_MAP)
+  const map = current && typeof current === 'object'
+    ? { ...(current as Record<string, unknown>) }
+    : {}
+
+  map[scopeKey] = {
+    updatedAt: Date.now(),
+    totalPosts: Number.isFinite(stats.totalPosts) ? Math.max(0, Math.floor(stats.totalPosts)) : 0,
+    totalFriends: Number.isFinite(stats.totalFriends) ? Math.max(0, Math.floor(stats.totalFriends)) : 0
+  }
+
+  await config.set(CONFIG_KEYS.EXPORT_SNS_STATS_CACHE_MAP, map)
 }
 
 // === 安全相关 ===

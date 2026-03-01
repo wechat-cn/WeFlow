@@ -290,6 +290,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getTimeline: (limit: number, offset: number, usernames?: string[], keyword?: string, startTime?: number, endTime?: number) =>
       ipcRenderer.invoke('sns:getTimeline', limit, offset, usernames, keyword, startTime, endTime),
     getSnsUsernames: () => ipcRenderer.invoke('sns:getSnsUsernames'),
+    getExportStatsFast: () => ipcRenderer.invoke('sns:getExportStatsFast'),
     getExportStats: () => ipcRenderer.invoke('sns:getExportStats'),
     debugResource: (url: string) => ipcRenderer.invoke('sns:debugResource', url),
     proxyImage: (payload: { url: string; key?: string | number }) => ipcRenderer.invoke('sns:proxyImage', payload),

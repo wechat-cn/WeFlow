@@ -196,6 +196,9 @@ class ChatService {
   // 缓存会话表信息，避免每次查询
   private sessionTablesCache = new Map<string, Array<{ tableName: string; dbPath: string }>>()
   private readonly sessionTablesCacheTtl = 300000 // 5分钟
+  private sessionMessageCountCache = new Map<string, { count: number; updatedAt: number }>()
+  private sessionMessageCountCacheScope = ''
+  private readonly sessionMessageCountCacheTtlMs = 10 * 60 * 1000
 
   constructor() {
     this.configService = new ConfigService()
@@ -795,13 +798,35 @@ class ChatService {
         return { success: true, counts: {} }
       }
 
+      this.refreshSessionMessageCountCacheScope()
       const counts: Record<string, number> = {}
-      await this.forEachWithConcurrency(normalizedSessionIds, 8, async (sessionId) => {
+      const now = Date.now()
+      const pendingSessionIds: string[] = []
+
+      for (const sessionId of normalizedSessionIds) {
+        const cached = this.sessionMessageCountCache.get(sessionId)
+        if (cached && now - cached.updatedAt <= this.sessionMessageCountCacheTtlMs) {
+          counts[sessionId] = cached.count
+        } else {
+          pendingSessionIds.push(sessionId)
+        }
+      }
+
+      await this.forEachWithConcurrency(pendingSessionIds, 16, async (sessionId) => {
         try {
           const result = await wcdbService.getMessageCount(sessionId)
-          counts[sessionId] = result.success && typeof result.count === 'number' ? result.count : 0
+          const nextCount = result.success && typeof result.count === 'number' ? result.count : 0
+          counts[sessionId] = nextCount
+          this.sessionMessageCountCache.set(sessionId, {
+            count: nextCount,
+            updatedAt: Date.now()
+          })
         } catch {
           counts[sessionId] = 0
+          this.sessionMessageCountCache.set(sessionId, {
+            count: 0,
+            updatedAt: Date.now()
+          })
         }
       })
 
@@ -1453,6 +1478,15 @@ class ChatService {
     })
 
     await Promise.all(runners)
+  }
+
+  private refreshSessionMessageCountCacheScope(): void {
+    const dbPath = String(this.configService.get('dbPath') || '')
+    const myWxid = String(this.configService.get('myWxid') || '')
+    const scope = `${dbPath}::${myWxid}`
+    if (scope === this.sessionMessageCountCacheScope) return
+    this.sessionMessageCountCacheScope = scope
+    this.sessionMessageCountCache.clear()
   }
 
   private async collectSessionExportStats(
