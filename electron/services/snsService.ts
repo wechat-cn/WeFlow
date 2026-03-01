@@ -235,6 +235,13 @@ class SnsService {
         this.contactCache = new ContactCacheService(this.configService.get('cachePath') as string)
     }
 
+    private parseCountValue(row: any): number {
+        if (!row || typeof row !== 'object') return 0
+        const raw = row.total ?? row.count ?? row.cnt ?? Object.values(row)[0]
+        const num = Number(raw)
+        return Number.isFinite(num) && num > 0 ? Math.floor(num) : 0
+    }
+
     private parseLikesFromXml(xml: string): string[] {
         if (!xml) return []
         const likes: string[] = []
@@ -357,6 +364,39 @@ class SnsService {
             return { success: true, usernames: result2.rows.map((r: any) => r.userName).filter(Boolean) }
         }
         return { success: true, usernames: result.rows.map((r: any) => r.user_name).filter(Boolean) }
+    }
+
+    async getExportStats(): Promise<{ success: boolean; data?: { totalPosts: number; totalFriends: number }; error?: string }> {
+        try {
+            let totalPosts = 0
+            const postCountResult = await wcdbService.execQuery('sns', null, 'SELECT COUNT(1) AS total FROM SnsTimeLine')
+            if (postCountResult.success && postCountResult.rows && postCountResult.rows.length > 0) {
+                totalPosts = this.parseCountValue(postCountResult.rows[0])
+            }
+
+            let totalFriends = 0
+            const friendCountPrimary = await wcdbService.execQuery(
+                'sns',
+                null,
+                "SELECT COUNT(DISTINCT user_name) AS total FROM SnsTimeLine WHERE user_name IS NOT NULL AND user_name <> ''"
+            )
+            if (friendCountPrimary.success && friendCountPrimary.rows && friendCountPrimary.rows.length > 0) {
+                totalFriends = this.parseCountValue(friendCountPrimary.rows[0])
+            } else {
+                const friendCountFallback = await wcdbService.execQuery(
+                    'sns',
+                    null,
+                    "SELECT COUNT(DISTINCT userName) AS total FROM SnsTimeLine WHERE userName IS NOT NULL AND userName <> ''"
+                )
+                if (friendCountFallback.success && friendCountFallback.rows && friendCountFallback.rows.length > 0) {
+                    totalFriends = this.parseCountValue(friendCountFallback.rows[0])
+                }
+            }
+
+            return { success: true, data: { totalPosts, totalFriends } }
+        } catch (e) {
+            return { success: false, error: String(e) }
+        }
     }
 
     // 安装朋友圈删除拦截

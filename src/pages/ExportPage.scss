@@ -14,65 +14,8 @@
 }
 
 .export-top-panel {
-  display: grid;
-  grid-template-columns: minmax(260px, 380px) 1fr;
-  gap: 14px;
+  display: block;
   flex-shrink: 0;
-}
-
-.current-user-box {
-  background: var(--card-bg);
-  border: 1px solid var(--border-color);
-  border-radius: 14px;
-  padding: 14px;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-
-  .avatar-wrap {
-    width: 48px;
-    height: 48px;
-    border-radius: 12px;
-    overflow: hidden;
-    background: linear-gradient(135deg, var(--primary), var(--primary-hover));
-    display: flex;
-    align-items: center;
-    justify-content: center;
-
-    img {
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
-    }
-
-    span {
-      color: #fff;
-      font-size: 18px;
-      font-weight: 600;
-    }
-  }
-
-  .user-meta {
-    min-width: 0;
-  }
-
-  .user-name {
-    font-size: 16px;
-    font-weight: 600;
-    color: var(--text-primary);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .user-wxid {
-    margin-top: 2px;
-    font-size: 12px;
-    color: var(--text-secondary);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
 }
 
 .global-export-controls {
@@ -120,6 +63,7 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
+    z-index: 40;
   }
 
   .layout-trigger {
@@ -142,14 +86,16 @@
     top: calc(100% + 6px);
     left: 0;
     right: 0;
-    background: var(--card-bg);
+    background: var(--bg-primary);
     border: 1px solid var(--border-color);
     border-radius: 12px;
-    box-shadow: var(--shadow-md);
+    box-shadow: 0 16px 36px rgba(0, 0, 0, 0.28);
     padding: 6px;
-    z-index: 20;
+    z-index: 3000;
     max-height: 260px;
     overflow-y: auto;
+    opacity: 1;
+    backdrop-filter: none;
   }
 
   .layout-option {
@@ -188,7 +134,7 @@
 
 .content-card-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(150px, 1fr));
+  grid-template-columns: repeat(6, minmax(150px, 1fr));
   gap: 10px;
   flex-shrink: 0;
 }
@@ -397,6 +343,7 @@
 .table-tabs {
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
 
   .tab-btn {
     border: 1px solid var(--border-color);
@@ -406,6 +353,9 @@
     border-radius: 999px;
     cursor: pointer;
     font-size: 13px;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
 
     &.active {
       border-color: var(--primary);

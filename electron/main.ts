@@ -1020,6 +1020,10 @@ function registerIpcHandlers() {
     return snsService.getSnsUsernames()
   })
 
+  ipcMain.handle('sns:getExportStats', async () => {
+    return snsService.getExportStats()
+  })
+
   ipcMain.handle('sns:debugResource', async (_, url: string) => {
     return snsService.debugResource(url)
   })

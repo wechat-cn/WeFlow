@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 import {
+  Aperture,
   CheckSquare,
   Download,
   ExternalLink,
@@ -20,10 +21,11 @@ import type { ExportOptions as ElectronExportOptions, ExportProgress } from '../
 import * as configService from '../services/config'
 import './ExportPage.scss'
 
-type ConversationTab = 'private' | 'group' | 'official'
+type ConversationTab = 'private' | 'group' | 'official' | 'former_friend'
 type TaskStatus = 'queued' | 'running' | 'success' | 'error'
-type TaskScope = 'single' | 'multi' | 'content'
+type TaskScope = 'single' | 'multi' | 'content' | 'sns'
 type ContentType = 'text' | 'voice' | 'image' | 'video' | 'emoji'
+type ContentCardType = ContentType | 'sns'
 
 type SessionLayout = 'shared' | 'per-session'
 
@@ -80,10 +82,16 @@ interface TaskProgress {
 interface ExportTaskPayload {
   sessionIds: string[]
   outputDir: string
-  options: ElectronExportOptions
+  options?: ElectronExportOptions
   scope: TaskScope
   contentType?: ContentType
   sessionNames: string[]
+  snsOptions?: {
+    format: 'json' | 'html'
+    exportMedia?: boolean
+    startTime?: number
+    endTime?: number
+  }
 }
 
 interface ExportTask {
@@ -105,12 +113,6 @@ interface ExportDialogState {
   sessionIds: string[]
   sessionNames: string[]
   title: string
-}
-
-interface CurrentUserProfile {
-  wxid: string
-  displayName: string
-  avatarUrl?: string
 }
 
 const defaultTxtColumns = ['index', 'time', 'senderRole', 'messageType', 'content']
@@ -212,6 +214,7 @@ const parseDateInput = (value: string, endOfDay: boolean): Date => {
 const toKindByContactType = (session: AppChatSession, contact?: ContactInfo): ConversationTab => {
   if (session.username.endsWith('@chatroom')) return 'group'
   if (contact?.type === 'official') return 'official'
+  if (contact?.type === 'former_friend') return 'former_friend'
   return 'private'
 }
 
@@ -241,8 +244,6 @@ function ExportPage() {
   const [searchKeyword, setSearchKeyword] = useState('')
   const [activeTab, setActiveTab] = useState<ConversationTab>('private')
   const [selectedSessions, setSelectedSessions] = useState<Set<string>>(new Set())
-
-  const [currentUser, setCurrentUser] = useState<CurrentUserProfile>({ wxid: '', displayName: '未识别用户' })
 
   const [exportFolder, setExportFolder] = useState('')
   const [writeLayout, setWriteLayout] = useState<configService.ExportWriteLayout>('A')
@@ -279,6 +280,11 @@ function ExportPage() {
   const [tasks, setTasks] = useState<ExportTask[]>([])
   const [lastExportBySession, setLastExportBySession] = useState<Record<string, number>>({})
   const [lastExportByContent, setLastExportByContent] = useState<Record<string, number>>({})
+  const [lastSnsExportPostCount, setLastSnsExportPostCount] = useState(0)
+  const [snsStats, setSnsStats] = useState<{ totalPosts: number; totalFriends: number }>({
+    totalPosts: 0,
+    totalFriends: 0
+  })
   const [nowTick, setNowTick] = useState(Date.now())
 
   const progressUnsubscribeRef = useRef<(() => void) | null>(null)
@@ -308,32 +314,9 @@ function ExportPage() {
     return () => clearInterval(timer)
   }, [])
 
-  const loadCurrentUser = useCallback(async () => {
-    try {
-      const wxid = await configService.getMyWxid()
-      let displayName = wxid || '未识别用户'
-      let avatarUrl: string | undefined
-
-      if (wxid) {
-        const myContact = await window.electronAPI.chat.getContact(wxid)
-        const bestName = [myContact?.remark, myContact?.nickName, myContact?.alias, wxid].find(Boolean)
-        if (bestName) displayName = bestName
-      }
-
-      const avatarResult = await window.electronAPI.chat.getMyAvatarUrl()
-      if (avatarResult.success && avatarResult.avatarUrl) {
-        avatarUrl = avatarResult.avatarUrl
-      }
-
-      setCurrentUser({ wxid: wxid || '', displayName, avatarUrl })
-    } catch (error) {
-      console.error('加载当前用户信息失败:', error)
-    }
-  }, [])
-
   const loadBaseConfig = useCallback(async () => {
     try {
-      const [savedPath, savedFormat, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedWriteLayout, savedSessionMap, savedContentMap] = await Promise.all([
+      const [savedPath, savedFormat, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedWriteLayout, savedSessionMap, savedContentMap, savedSnsPostCount] = await Promise.all([
         configService.getExportPath(),
         configService.getExportDefaultFormat(),
         configService.getExportDefaultMedia(),
@@ -343,7 +326,8 @@ function ExportPage() {
         configService.getExportDefaultConcurrency(),
         configService.getExportWriteLayout(),
         configService.getExportLastSessionRunMap(),
-        configService.getExportLastContentRunMap()
+        configService.getExportLastContentRunMap(),
+        configService.getExportLastSnsPostCount()
       ])
 
       if (savedPath) {
@@ -356,6 +340,7 @@ function ExportPage() {
       setWriteLayout(savedWriteLayout)
       setLastExportBySession(savedSessionMap)
       setLastExportByContent(savedContentMap)
+      setLastSnsExportPostCount(savedSnsPostCount)
 
       const txtColumns = savedTxtColumns && savedTxtColumns.length > 0 ? savedTxtColumns : defaultTxtColumns
       setOptions(prev => ({
@@ -369,6 +354,20 @@ function ExportPage() {
       }))
     } catch (error) {
       console.error('加载导出配置失败:', error)
+    }
+  }, [])
+
+  const loadSnsStats = useCallback(async () => {
+    try {
+      const result = await window.electronAPI.sns.getExportStats()
+      if (result.success && result.data) {
+        setSnsStats({
+          totalPosts: result.data.totalPosts || 0,
+          totalFriends: result.data.totalFriends || 0
+        })
+      }
+    } catch (error) {
+      console.error('加载朋友圈导出统计失败:', error)
     }
   }, [])
 
@@ -418,10 +417,10 @@ function ExportPage() {
   }, [])
 
   useEffect(() => {
-    loadCurrentUser()
     loadBaseConfig()
     loadSessions()
-  }, [loadCurrentUser, loadBaseConfig, loadSessions])
+    loadSnsStats()
+  }, [loadBaseConfig, loadSessions, loadSnsStats])
 
   useEffect(() => {
     preselectAppliedRef.current = false
@@ -541,6 +540,14 @@ function ExportPage() {
   const openExportDialog = (payload: Omit<ExportDialogState, 'open'>) => {
     setExportDialog({ open: true, ...payload })
 
+    if (payload.scope === 'sns') {
+      setOptions(prev => ({
+        ...prev,
+        format: prev.format === 'json' || prev.format === 'html' ? prev.format : 'html'
+      }))
+      return
+    }
+
     if (payload.scope === 'content' && payload.contentType) {
       if (payload.contentType === 'text') {
         setOptions(prev => ({ ...prev, exportMedia: false }))
@@ -613,6 +620,25 @@ function ExportPage() {
     return base
   }
 
+  const buildSnsExportOptions = () => {
+    const format: 'json' | 'html' = options.format === 'json' ? 'json' : 'html'
+    const dateRange = options.useAllTime
+      ? null
+      : options.dateRange
+        ? {
+            startTime: Math.floor(options.dateRange.start.getTime() / 1000),
+            endTime: Math.floor(options.dateRange.end.getTime() / 1000)
+          }
+        : null
+
+    return {
+      format,
+      exportMedia: options.exportMedia,
+      startTime: dateRange?.startTime,
+      endTime: dateRange?.endTime
+    }
+  }
+
   const markSessionExported = useCallback((sessionIds: string[], timestamp: number) => {
     setLastExportBySession(prev => {
       const next = { ...prev }
@@ -663,56 +689,117 @@ function ExportPage() {
     updateTask(next.id, task => ({ ...task, status: 'running', startedAt: Date.now() }))
 
     progressUnsubscribeRef.current?.()
-    progressUnsubscribeRef.current = window.electronAPI.export.onProgress((payload: ExportProgress) => {
-      updateTask(next.id, task => ({
-        ...task,
-        progress: {
-          current: payload.current,
-          total: payload.total,
-          currentName: payload.currentSession,
-          phaseLabel: payload.phaseLabel || '',
-          phaseProgress: payload.phaseProgress || 0,
-          phaseTotal: payload.phaseTotal || 0
-        }
-      }))
-    })
-
-    try {
-      const result = await window.electronAPI.export.exportSessions(
-        next.payload.sessionIds,
-        next.payload.outputDir,
-        next.payload.options
-      )
-
-      if (!result.success) {
+    if (next.payload.scope === 'sns') {
+      progressUnsubscribeRef.current = window.electronAPI.sns.onExportProgress((payload) => {
         updateTask(next.id, task => ({
           ...task,
-          status: 'error',
-          finishedAt: Date.now(),
-          error: result.error || '导出失败'
-        }))
-      } else {
-        const doneAt = Date.now()
-        const contentTypes = next.payload.contentType
-          ? [next.payload.contentType]
-          : inferContentTypesFromOptions(next.payload.options)
-
-        markSessionExported(next.payload.sessionIds, doneAt)
-        markContentExported(next.payload.sessionIds, contentTypes, doneAt)
-
-        updateTask(next.id, task => ({
-          ...task,
-          status: 'success',
-          finishedAt: doneAt,
           progress: {
-            ...task.progress,
-            current: task.progress.total || next.payload.sessionIds.length,
-            total: task.progress.total || next.payload.sessionIds.length,
-            phaseLabel: '完成',
-            phaseProgress: 1,
-            phaseTotal: 1
+            current: payload.current || 0,
+            total: payload.total || 0,
+            currentName: '',
+            phaseLabel: payload.status || '',
+            phaseProgress: payload.total > 0 ? payload.current : 0,
+            phaseTotal: payload.total || 0
           }
         }))
+      })
+    } else {
+      progressUnsubscribeRef.current = window.electronAPI.export.onProgress((payload: ExportProgress) => {
+        updateTask(next.id, task => ({
+          ...task,
+          progress: {
+            current: payload.current,
+            total: payload.total,
+            currentName: payload.currentSession,
+            phaseLabel: payload.phaseLabel || '',
+            phaseProgress: payload.phaseProgress || 0,
+            phaseTotal: payload.phaseTotal || 0
+          }
+        }))
+      })
+    }
+
+    try {
+      if (next.payload.scope === 'sns') {
+        const snsOptions = next.payload.snsOptions || { format: 'html' as const, exportMedia: false }
+        const result = await window.electronAPI.sns.exportTimeline({
+          outputDir: next.payload.outputDir,
+          format: snsOptions.format,
+          exportMedia: snsOptions.exportMedia,
+          startTime: snsOptions.startTime,
+          endTime: snsOptions.endTime
+        })
+
+        if (!result.success) {
+          updateTask(next.id, task => ({
+            ...task,
+            status: 'error',
+            finishedAt: Date.now(),
+            error: result.error || '朋友圈导出失败'
+          }))
+        } else {
+          const doneAt = Date.now()
+          const exportedPosts = Math.max(0, result.postCount || 0)
+          const mergedExportedCount = Math.max(lastSnsExportPostCount, exportedPosts)
+          setLastSnsExportPostCount(mergedExportedCount)
+          await configService.setExportLastSnsPostCount(mergedExportedCount)
+          await loadSnsStats()
+
+          updateTask(next.id, task => ({
+            ...task,
+            status: 'success',
+            finishedAt: doneAt,
+            progress: {
+              ...task.progress,
+              current: exportedPosts,
+              total: exportedPosts,
+              phaseLabel: '完成',
+              phaseProgress: 1,
+              phaseTotal: 1
+            }
+          }))
+        }
+      } else {
+        if (!next.payload.options) {
+          throw new Error('导出参数缺失')
+        }
+
+        const result = await window.electronAPI.export.exportSessions(
+          next.payload.sessionIds,
+          next.payload.outputDir,
+          next.payload.options
+        )
+
+        if (!result.success) {
+          updateTask(next.id, task => ({
+            ...task,
+            status: 'error',
+            finishedAt: Date.now(),
+            error: result.error || '导出失败'
+          }))
+        } else {
+          const doneAt = Date.now()
+          const contentTypes = next.payload.contentType
+            ? [next.payload.contentType]
+            : inferContentTypesFromOptions(next.payload.options)
+
+          markSessionExported(next.payload.sessionIds, doneAt)
+          markContentExported(next.payload.sessionIds, contentTypes, doneAt)
+
+          updateTask(next.id, task => ({
+            ...task,
+            status: 'success',
+            finishedAt: doneAt,
+            progress: {
+              ...task.progress,
+              current: task.progress.total || next.payload.sessionIds.length,
+              total: task.progress.total || next.payload.sessionIds.length,
+              phaseLabel: '完成',
+              phaseProgress: 1,
+              phaseTotal: 1
+            }
+          }))
+        }
       }
     } catch (error) {
       updateTask(next.id, task => ({
@@ -727,7 +814,7 @@ function ExportPage() {
       runningTaskIdRef.current = null
       void runNextTask()
     }
-  }, [updateTask, markSessionExported, markContentExported])
+  }, [updateTask, markSessionExported, markContentExported, loadSnsStats, lastSnsExportPostCount])
 
   useEffect(() => {
     void runNextTask()
@@ -741,15 +828,23 @@ function ExportPage() {
   }, [])
 
   const createTask = async () => {
-    if (!exportDialog.open || exportDialog.sessionIds.length === 0 || !exportFolder) return
+    if (!exportDialog.open || !exportFolder) return
+    if (exportDialog.scope !== 'sns' && exportDialog.sessionIds.length === 0) return
 
-    const exportOptions = buildExportOptions(exportDialog.scope, exportDialog.contentType)
+    const exportOptions = exportDialog.scope === 'sns'
+      ? undefined
+      : buildExportOptions(exportDialog.scope, exportDialog.contentType)
+    const snsOptions = exportDialog.scope === 'sns'
+      ? buildSnsExportOptions()
+      : undefined
     const title =
       exportDialog.scope === 'single'
         ? `${exportDialog.sessionNames[0] || '会话'} 导出`
         : exportDialog.scope === 'multi'
           ? `批量导出（${exportDialog.sessionIds.length} 个会话）`
-          : `${contentTypeLabels[exportDialog.contentType || 'text']}批量导出`
+          : exportDialog.scope === 'sns'
+            ? '朋友圈批量导出'
+            : `${contentTypeLabels[exportDialog.contentType || 'text']}批量导出`
 
     const task: ExportTask = {
       id: createTaskId(),
@@ -762,7 +857,8 @@ function ExportPage() {
         outputDir: exportFolder,
         options: exportOptions,
         scope: exportDialog.scope,
-        contentType: exportDialog.contentType
+        contentType: exportDialog.contentType,
+        snsOptions
       },
       progress: createEmptyProgress()
     }
@@ -819,6 +915,15 @@ function ExportPage() {
     })
   }
 
+  const openSnsExport = () => {
+    openExportDialog({
+      scope: 'sns',
+      sessionIds: [],
+      sessionNames: ['全部朋友圈动态'],
+      title: '朋友圈批量导出'
+    })
+  }
+
   const runningSessionIds = useMemo(() => {
     const set = new Set<string>()
     for (const task of tasks) {
@@ -841,11 +946,25 @@ function ExportPage() {
     return set
   }, [tasks])
 
+  const tabCounts = useMemo(() => {
+    const counts: Record<ConversationTab, number> = {
+      private: 0,
+      group: 0,
+      official: 0,
+      former_friend: 0
+    }
+    for (const session of sessions) {
+      counts[session.kind] += 1
+    }
+    return counts
+  }, [sessions])
+
   const contentCards = useMemo(() => {
     const scopeSessions = sessions.filter(session => session.kind === 'private' || session.kind === 'group')
-    const total = scopeSessions.length
+    const totalSessions = scopeSessions.length
+    const snsExportedCount = Math.min(lastSnsExportPostCount, snsStats.totalPosts)
 
-    return [
+    const sessionCards = [
       { type: 'text' as ContentType, icon: MessageSquareText },
       { type: 'voice' as ContentType, icon: Mic },
       { type: 'image' as ContentType, icon: ImageIcon },
@@ -862,15 +981,31 @@ function ExportPage() {
       return {
         ...item,
         label: contentTypeLabels[item.type],
-        total,
-        exported
+        stats: [
+          { label: '总会话数', value: totalSessions },
+          { label: '已导出会话数', value: exported }
+        ]
       }
     })
-  }, [sessions, lastExportByContent])
+
+    const snsCard = {
+      type: 'sns' as ContentCardType,
+      icon: Aperture,
+      label: '朋友圈',
+      stats: [
+        { label: '朋友圈条数', value: snsStats.totalPosts },
+        { label: '好友数', value: snsStats.totalFriends },
+        { label: '已导出朋友圈条数', value: snsExportedCount }
+      ]
+    }
+
+    return [...sessionCards, snsCard]
+  }, [sessions, lastExportByContent, snsStats, lastSnsExportPostCount])
 
   const activeTabLabel = useMemo(() => {
     if (activeTab === 'private') return '私聊'
     if (activeTab === 'group') return '群聊'
+    if (activeTab === 'former_friend') return '曾经的好友'
     return '公众号'
   }, [activeTab])
 
@@ -913,7 +1048,7 @@ function ExportPage() {
   }
 
   const renderTableHeader = () => {
-    if (activeTab === 'private') {
+    if (activeTab === 'private' || activeTab === 'former_friend') {
       return (
         <tr>
           <th className="sticky-col">选择</th>
@@ -991,7 +1126,7 @@ function ExportPage() {
         <td>{valueOrDash(metrics.videoMessages)}</td>
         <td>{valueOrDash(metrics.emojiMessages)}</td>
 
-        {activeTab === 'private' && (
+        {(activeTab === 'private' || activeTab === 'former_friend') && (
           <>
             <td>{valueOrDash(metrics.privateMutualGroups)}</td>
             <td>{timestampOrDash(metrics.firstTimestamp)}</td>
@@ -1032,20 +1167,27 @@ function ExportPage() {
   }, [visibleSessions, selectedSessions])
 
   const writeLayoutLabel = writeLayoutOptions.find(option => option.value === writeLayout)?.label || 'A（类型分目录）'
+  const tableColSpan = activeTab === 'group' ? 14 : (activeTab === 'private' || activeTab === 'former_friend' ? 11 : 10)
+  const canCreateTask = exportDialog.scope === 'sns'
+    ? Boolean(exportFolder)
+    : Boolean(exportFolder) && exportDialog.sessionIds.length > 0
+  const scopeLabel = exportDialog.scope === 'single'
+    ? '单会话'
+    : exportDialog.scope === 'multi'
+      ? '多会话'
+      : exportDialog.scope === 'sns'
+        ? '朋友圈批量'
+        : `按内容批量（${contentTypeLabels[exportDialog.contentType || 'text']}）`
+  const scopeCountLabel = exportDialog.scope === 'sns'
+    ? `共 ${snsStats.totalPosts} 条朋友圈动态`
+    : `共 ${exportDialog.sessionIds.length} 个会话`
+  const formatCandidateOptions = exportDialog.scope === 'sns'
+    ? formatOptions.filter(option => option.value === 'html' || option.value === 'json')
+    : formatOptions
 
   return (
     <div className="export-board-page">
       <div className="export-top-panel">
-        <div className="current-user-box">
-          <div className="avatar-wrap">
-            {currentUser.avatarUrl ? <img src={currentUser.avatarUrl} alt="" /> : <span>{getAvatarLetter(currentUser.displayName)}</span>}
-          </div>
-          <div className="user-meta">
-            <div className="user-name">{currentUser.displayName}</div>
-            <div className="user-wxid">{currentUser.wxid || 'wxid 未识别'}</div>
-          </div>
-        </div>
-
         <div className="global-export-controls">
           <div className="path-control">
             <span className="control-label">导出位置</span>
@@ -1074,7 +1216,7 @@ function ExportPage() {
           </div>
 
           <div className="write-layout-control">
-            <span className="control-label">写入格式</span>
+            <span className="control-label">写入目录方式</span>
             <button className="layout-trigger" onClick={() => setShowWriteLayoutSelect(prev => !prev)}>
               {writeLayoutLabel}
             </button>
@@ -1109,16 +1251,25 @@ function ExportPage() {
                 <div className="card-title"><Icon size={16} /> {card.label}</div>
               </div>
               <div className="card-stats">
-                <div className="stat-item">
-                  <span>总会话数</span>
-                  <strong>{card.total}</strong>
-                </div>
-                <div className="stat-item">
-                  <span>已导出会话数</span>
-                  <strong>{card.exported}</strong>
-                </div>
+                {card.stats.map((stat) => (
+                  <div key={stat.label} className="stat-item">
+                    <span>{stat.label}</span>
+                    <strong>{stat.value.toLocaleString()}</strong>
+                  </div>
+                ))}
               </div>
-              <button className="card-export-btn" onClick={() => openContentExport(card.type)}>导出</button>
+              <button
+                className="card-export-btn"
+                onClick={() => {
+                  if (card.type === 'sns') {
+                    openSnsExport()
+                    return
+                  }
+                  openContentExport(card.type)
+                }}
+              >
+                导出
+              </button>
             </div>
           )
         })}
@@ -1147,7 +1298,9 @@ function ExportPage() {
                         />
                       </div>
                       <div className="task-progress-text">
-                        {task.progress.current} / {task.progress.total || task.payload.sessionIds.length}
+                        {task.progress.total > 0
+                          ? `${task.progress.current} / ${task.progress.total}`
+                          : '处理中'}
                         {task.progress.phaseLabel ? ` · ${task.progress.phaseLabel}` : ''}
                       </div>
                     </>
@@ -1168,9 +1321,18 @@ function ExportPage() {
       <div className="session-table-section">
         <div className="table-toolbar">
           <div className="table-tabs" role="tablist" aria-label="会话类型">
-            <button className={`tab-btn ${activeTab === 'private' ? 'active' : ''}`} onClick={() => setActiveTab('private')}>私聊</button>
-            <button className={`tab-btn ${activeTab === 'group' ? 'active' : ''}`} onClick={() => setActiveTab('group')}>群聊</button>
-            <button className={`tab-btn ${activeTab === 'official' ? 'active' : ''}`} onClick={() => setActiveTab('official')}>公众号</button>
+            <button className={`tab-btn ${activeTab === 'private' ? 'active' : ''}`} onClick={() => setActiveTab('private')}>
+              私聊（{tabCounts.private}）
+            </button>
+            <button className={`tab-btn ${activeTab === 'group' ? 'active' : ''}`} onClick={() => setActiveTab('group')}>
+              群聊（{tabCounts.group}）
+            </button>
+            <button className={`tab-btn ${activeTab === 'official' ? 'active' : ''}`} onClick={() => setActiveTab('official')}>
+              公众号（{tabCounts.official}）
+            </button>
+            <button className={`tab-btn ${activeTab === 'former_friend' ? 'active' : ''}`} onClick={() => setActiveTab('former_friend')}>
+              曾经的好友（{tabCounts.former_friend}）
+            </button>
           </div>
 
           <div className="toolbar-actions">
@@ -1210,13 +1372,13 @@ function ExportPage() {
             <tbody>
               {isLoading ? (
                 <tr>
-                  <td colSpan={activeTab === 'group' ? 14 : activeTab === 'private' ? 11 : 10}>
+                  <td colSpan={tableColSpan}>
                     <div className="table-state"><Loader2 size={16} className="spin" />加载中...</div>
                   </td>
                 </tr>
               ) : visibleSessions.length === 0 ? (
                 <tr>
-                  <td colSpan={activeTab === 'group' ? 14 : activeTab === 'private' ? 11 : 10}>
+                  <td colSpan={tableColSpan}>
                     <div className="table-state">暂无会话</div>
                   </td>
                 </tr>
@@ -1239,8 +1401,8 @@ function ExportPage() {
             <div className="dialog-section">
               <h4>导出范围</h4>
               <div className="scope-tag-row">
-                <span className="scope-tag">{exportDialog.scope === 'single' ? '单会话' : exportDialog.scope === 'multi' ? '多会话' : `按内容批量（${contentTypeLabels[exportDialog.contentType || 'text']}）`}</span>
-                <span className="scope-count">共 {exportDialog.sessionIds.length} 个会话</span>
+                <span className="scope-tag">{scopeLabel}</span>
+                <span className="scope-count">{scopeCountLabel}</span>
               </div>
               <div className="scope-list">
                 {exportDialog.sessionNames.slice(0, 20).map(name => (
@@ -1253,7 +1415,7 @@ function ExportPage() {
             <div className="dialog-section">
               <h4>对话文本导出格式选择</h4>
               <div className="format-grid">
-                {formatOptions.map(option => (
+                {formatCandidateOptions.map(option => (
                   <button
                     key={option.value}
                     className={`format-card ${options.format === option.value ? 'active' : ''}`}
@@ -1363,7 +1525,7 @@ function ExportPage() {
 
             <div className="dialog-actions">
               <button className="secondary-btn" onClick={closeExportDialog}>取消</button>
-              <button className="primary-btn" onClick={() => void createTask()} disabled={!exportFolder || exportDialog.sessionIds.length === 0}>
+              <button className="primary-btn" onClick={() => void createTask()} disabled={!canCreateTask}>
                 <Download size={14} /> 创建导出任务
               </button>
             </div>

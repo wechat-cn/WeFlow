@@ -2,18 +2,68 @@ import { useState, useEffect } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
 import { Home, MessageSquare, BarChart3, Users, FileText, Database, Settings, ChevronLeft, ChevronRight, Download, Aperture, UserCircle, Lock } from 'lucide-react'
 import { useAppStore } from '../stores/appStore'
+import * as configService from '../services/config'
 
 import './Sidebar.scss'
+
+interface SidebarUserProfile {
+  wxid: string
+  displayName: string
+  avatarUrl?: string
+}
 
 function Sidebar() {
   const location = useLocation()
   const [collapsed, setCollapsed] = useState(false)
   const [authEnabled, setAuthEnabled] = useState(false)
+  const [userProfile, setUserProfile] = useState<SidebarUserProfile>({
+    wxid: '',
+    displayName: '未识别用户'
+  })
   const setLocked = useAppStore(state => state.setLocked)
 
   useEffect(() => {
     window.electronAPI.auth.verifyEnabled().then(setAuthEnabled)
   }, [])
+
+  useEffect(() => {
+    const loadCurrentUser = async () => {
+      try {
+        const wxid = await configService.getMyWxid()
+        let displayName = wxid || '未识别用户'
+
+        if (wxid) {
+          const myContact = await window.electronAPI.chat.getContact(wxid)
+          const bestName = [myContact?.remark, myContact?.nickName, myContact?.alias, wxid].find(Boolean)
+          if (bestName) displayName = bestName
+        }
+
+        let avatarUrl: string | undefined
+        const avatarResult = await window.electronAPI.chat.getMyAvatarUrl()
+        if (avatarResult.success && avatarResult.avatarUrl) {
+          avatarUrl = avatarResult.avatarUrl
+        }
+
+        setUserProfile({
+          wxid: wxid || '',
+          displayName,
+          avatarUrl
+        })
+      } catch (error) {
+        console.error('加载侧边栏用户信息失败:', error)
+      }
+    }
+
+    void loadCurrentUser()
+    const onWxidChanged = () => { void loadCurrentUser() }
+    window.addEventListener('wxid-changed', onWxidChanged as EventListener)
+    return () => window.removeEventListener('wxid-changed', onWxidChanged as EventListener)
+  }, [])
+
+  const getAvatarLetter = (name: string): string => {
+    if (!name) return '?'
+    return [...name][0] || '?'
+  }
 
   const isActive = (path: string) => {
     return location.pathname === path || location.pathname.startsWith(`${path}/`)
@@ -106,6 +156,19 @@ function Sidebar() {
       </nav>
 
       <div className="sidebar-footer">
+        <div
+          className="sidebar-user-card"
+          title={collapsed ? `${userProfile.displayName}${userProfile.wxid ? `\n${userProfile.wxid}` : ''}` : undefined}
+        >
+          <div className="user-avatar">
+            {userProfile.avatarUrl ? <img src={userProfile.avatarUrl} alt="" /> : <span>{getAvatarLetter(userProfile.displayName)}</span>}
+          </div>
+          <div className="user-meta">
+            <div className="user-name">{userProfile.displayName}</div>
+            <div className="user-wxid">{userProfile.wxid || 'wxid 未识别'}</div>
+          </div>
+        </div>
+
         {authEnabled && (
           <button
             className="nav-item"

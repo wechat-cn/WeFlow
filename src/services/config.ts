@@ -35,6 +35,7 @@ export const CONFIG_KEYS = {
   EXPORT_WRITE_LAYOUT: 'exportWriteLayout',
   EXPORT_LAST_SESSION_RUN_MAP: 'exportLastSessionRunMap',
   EXPORT_LAST_CONTENT_RUN_MAP: 'exportLastContentRunMap',
+  EXPORT_LAST_SNS_POST_COUNT: 'exportLastSnsPostCount',
 
   // 安全
   AUTH_ENABLED: 'authEnabled',
@@ -433,6 +434,19 @@ export async function getExportLastContentRunMap(): Promise<Record<string, numbe
 
 export async function setExportLastContentRunMap(map: Record<string, number>): Promise<void> {
   await config.set(CONFIG_KEYS.EXPORT_LAST_CONTENT_RUN_MAP, map)
+}
+
+export async function getExportLastSnsPostCount(): Promise<number> {
+  const value = await config.get(CONFIG_KEYS.EXPORT_LAST_SNS_POST_COUNT)
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+    return Math.floor(value)
+  }
+  return 0
+}
+
+export async function setExportLastSnsPostCount(count: number): Promise<void> {
+  const normalized = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0
+  await config.set(CONFIG_KEYS.EXPORT_LAST_SNS_POST_COUNT, normalized)
 }
 
 // === 安全相关 ===
