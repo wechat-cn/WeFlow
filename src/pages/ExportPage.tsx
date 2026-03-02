@@ -319,6 +319,7 @@ const WriteLayoutSelector = memo(function WriteLayoutSelector({
 
 function ExportPage() {
   const location = useLocation()
+  const isExportRoute = location.pathname === '/export'
 
   const [isLoading, setIsLoading] = useState(true)
   const [isSessionEnriching, setIsSessionEnriching] = useState(false)
@@ -690,6 +691,7 @@ function ExportPage() {
   }, [syncContactTypeCounts])
 
   useEffect(() => {
+    if (!isExportRoute) return
     void loadBaseConfig()
     void ensureSharedTabCountsLoaded()
     void loadSessions()
@@ -700,7 +702,16 @@ function ExportPage() {
     }, 120)
 
     return () => window.clearTimeout(timer)
-  }, [ensureSharedTabCountsLoaded, loadBaseConfig, loadSessions, loadSnsStats])
+  }, [isExportRoute, ensureSharedTabCountsLoaded, loadBaseConfig, loadSessions, loadSnsStats])
+
+  useEffect(() => {
+    if (isExportRoute) return
+    // 导出页隐藏时停止后台统计请求，避免与通讯录页面查询抢占。
+    sessionLoadTokenRef.current = Date.now()
+    loadingMessageCountsRef.current.clear()
+    loadingMetricsRef.current.clear()
+    setIsSessionEnriching(false)
+  }, [isExportRoute])
 
   useEffect(() => {
     preselectAppliedRef.current = false
@@ -754,6 +765,7 @@ function ExportPage() {
   }, [visibleSessions])
 
   const ensureSessionMessageCounts = useCallback(async (targetSessions: SessionRow[]) => {
+    if (!isExportRoute) return
     const loadTokenAtStart = sessionLoadTokenRef.current
     const currentCounts = sessionMessageCountsRef.current
     const pending = targetSessions.filter(
@@ -797,9 +809,10 @@ function ExportPage() {
         loadingMessageCountsRef.current.delete(session.username)
       }
     }
-  }, [])
+  }, [isExportRoute])
 
   const ensureSessionMetrics = useCallback(async (targetSessions: SessionRow[]) => {
+    if (!isExportRoute) return
     const loadTokenAtStart = sessionLoadTokenRef.current
     const currentMetrics = sessionMetricsRef.current
     const pending = targetSessions.filter(session => !currentMetrics[session.username] && !loadingMetricsRef.current.has(session.username))
@@ -857,14 +870,16 @@ function ExportPage() {
     if (loadTokenAtStart === sessionLoadTokenRef.current && Object.keys(updates).length > 0) {
       setSessionMetrics(prev => ({ ...prev, ...updates }))
     }
-  }, [])
+  }, [isExportRoute])
 
   useEffect(() => {
+    if (!isExportRoute) return
     const targets = visibleSessions.slice(0, MESSAGE_COUNT_VIEWPORT_PREFETCH)
     void ensureSessionMessageCounts(targets)
-  }, [visibleSessions, ensureSessionMessageCounts])
+  }, [isExportRoute, visibleSessions, ensureSessionMessageCounts])
 
   useEffect(() => {
+    if (!isExportRoute) return
     if (sessions.length === 0) return
     const activeTabTargets = sessions
       .filter(session => session.kind === activeTab)
@@ -872,14 +887,16 @@ function ExportPage() {
       .slice(0, MESSAGE_COUNT_ACTIVE_TAB_WARMUP_LIMIT)
     if (activeTabTargets.length === 0) return
     void ensureSessionMessageCounts(activeTabTargets)
-  }, [sessions, activeTab, ensureSessionMessageCounts])
+  }, [isExportRoute, sessions, activeTab, ensureSessionMessageCounts])
 
   useEffect(() => {
+    if (!isExportRoute) return
     const targets = visibleSessions.slice(0, METRICS_VIEWPORT_PREFETCH)
     void ensureSessionMetrics(targets)
-  }, [visibleSessions, ensureSessionMetrics])
+  }, [isExportRoute, visibleSessions, ensureSessionMetrics])
 
   const handleTableRangeChanged = useCallback((range: { startIndex: number; endIndex: number }) => {
+    if (!isExportRoute) return
     const current = visibleSessionsRef.current
     if (current.length === 0) return
     const prefetch = Math.max(MESSAGE_COUNT_VIEWPORT_PREFETCH, METRICS_VIEWPORT_PREFETCH)
@@ -889,9 +906,10 @@ function ExportPage() {
     const rangeSessions = current.slice(start, end + 1)
     void ensureSessionMessageCounts(rangeSessions)
     void ensureSessionMetrics(rangeSessions)
-  }, [ensureSessionMessageCounts, ensureSessionMetrics])
+  }, [isExportRoute, ensureSessionMessageCounts, ensureSessionMetrics])
 
   useEffect(() => {
+    if (!isExportRoute) return
     if (sessions.length === 0) return
     const prioritySessions = [
       ...sessions.filter(session => session.kind === activeTab),
@@ -909,7 +927,7 @@ function ExportPage() {
     }, METRICS_BACKGROUND_INTERVAL_MS)
 
     return () => window.clearInterval(timer)
-  }, [sessions, activeTab, ensureSessionMetrics])
+  }, [isExportRoute, sessions, activeTab, ensureSessionMetrics])
 
   const selectedCount = selectedSessions.size
 
