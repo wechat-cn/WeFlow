@@ -24,6 +24,11 @@ export interface GroupMember {
   isOwner?: boolean
 }
 
+export interface GroupMembersPanelEntry extends GroupMember {
+  isFriend: boolean
+  messageCount: number
+}
+
 export interface GroupMessageRank {
   member: GroupMember
   messageCount: number
@@ -44,8 +49,26 @@ export interface GroupMediaStats {
   total: number
 }
 
+interface GroupMemberContactInfo {
+  remark: string
+  nickName: string
+  alias: string
+  username: string
+  userName: string
+  encryptUsername: string
+  encryptUserName: string
+  localType: number
+}
+
 class GroupAnalyticsService {
   private configService: ConfigService
+  private readonly groupMembersPanelCacheTtlMs = 10 * 60 * 1000
+  private readonly groupMembersPanelCache = new Map<string, { updatedAt: number; data: GroupMembersPanelEntry[] }>()
+  private readonly groupMembersPanelInFlight = new Map<
+    string,
+    Promise<{ success: boolean; data?: GroupMembersPanelEntry[]; error?: string; fromCache?: boolean; updatedAt?: number }>
+  >()
+  private readonly friendExcludeNames = new Set(['medianote', 'floatbottle', 'qmessage', 'qqmail', 'fmessage'])
 
   constructor() {
     this.configService = new ConfigService()
@@ -419,6 +442,166 @@ class GroupAnalyticsService {
     return Array.from(set)
   }
 
+  private toNonNegativeInteger(value: unknown): number {
+    const parsed = Number(value)
+    if (!Number.isFinite(parsed)) return 0
+    return Math.max(0, Math.floor(parsed))
+  }
+
+  private pickStringField(row: Record<string, unknown>, keys: string[]): string {
+    for (const key of keys) {
+      const value = row[key]
+      if (value == null) continue
+      const text = String(value).trim()
+      if (text) return text
+    }
+    return ''
+  }
+
+  private pickIntegerField(row: Record<string, unknown>, keys: string[], fallback: number = 0): number {
+    for (const key of keys) {
+      const value = row[key]
+      if (value == null || value === '') continue
+      const parsed = Number(value)
+      if (Number.isFinite(parsed)) return Math.floor(parsed)
+    }
+    return fallback
+  }
+
+  private buildGroupMembersPanelCacheKey(chatroomId: string): string {
+    const dbPath = String(this.configService.get('dbPath') || '').trim()
+    const wxid = this.cleanAccountDirName(String(this.configService.get('myWxid') || '').trim())
+    return `${dbPath}::${wxid}::${chatroomId}`
+  }
+
+  private pruneGroupMembersPanelCache(maxEntries: number = 80): void {
+    if (this.groupMembersPanelCache.size <= maxEntries) return
+    const entries = Array.from(this.groupMembersPanelCache.entries())
+      .sort((a, b) => a[1].updatedAt - b[1].updatedAt)
+    const removeCount = this.groupMembersPanelCache.size - maxEntries
+    for (let i = 0; i < removeCount; i += 1) {
+      this.groupMembersPanelCache.delete(entries[i][0])
+    }
+  }
+
+  private async buildGroupMemberContactLookup(usernames: string[]): Promise<Map<string, GroupMemberContactInfo>> {
+    const lookup = new Map<string, GroupMemberContactInfo>()
+    const candidates = this.buildIdCandidates(usernames)
+    if (candidates.length === 0) return lookup
+
+    const batchSize = 200
+    for (let i = 0; i < candidates.length; i += batchSize) {
+      const batch = candidates.slice(i, i + batchSize)
+      if (batch.length === 0) continue
+
+      const inList = batch.map((username) => `'${username.replace(/'/g, "''")}'`).join(',')
+      const sql = `SELECT * FROM contact WHERE username IN (${inList})`
+      const result = await wcdbService.execQuery('contact', null, sql)
+      if (!result.success || !result.rows) continue
+
+      for (const row of result.rows as Record<string, unknown>[]) {
+        const contact: GroupMemberContactInfo = {
+          remark: this.pickStringField(row, ['remark', 'WCDB_CT_remark']),
+          nickName: this.pickStringField(row, ['nick_name', 'nickName', 'WCDB_CT_nick_name']),
+          alias: this.pickStringField(row, ['alias', 'WCDB_CT_alias']),
+          username: this.pickStringField(row, ['username', 'WCDB_CT_username']),
+          userName: this.pickStringField(row, ['user_name', 'userName', 'WCDB_CT_user_name']),
+          encryptUsername: this.pickStringField(row, ['encrypt_username', 'encryptUsername', 'WCDB_CT_encrypt_username']),
+          encryptUserName: this.pickStringField(row, ['encrypt_user_name', 'encryptUserName', 'WCDB_CT_encrypt_user_name']),
+          localType: this.pickIntegerField(row, ['local_type', 'localType', 'WCDB_CT_local_type'], 0)
+        }
+        const lookupKeys = this.buildIdCandidates([
+          contact.username,
+          contact.userName,
+          contact.encryptUsername,
+          contact.encryptUserName,
+          contact.alias
+        ])
+        for (const key of lookupKeys) {
+          const normalized = key.toLowerCase()
+          if (!lookup.has(normalized)) {
+            lookup.set(normalized, contact)
+          }
+        }
+      }
+    }
+    return lookup
+  }
+
+  private resolveContactByCandidates(
+    lookup: Map<string, GroupMemberContactInfo>,
+    candidates: Array<string | undefined | null>
+  ): GroupMemberContactInfo | undefined {
+    const ids = this.buildIdCandidates(candidates)
+    for (const id of ids) {
+      const hit = lookup.get(id.toLowerCase())
+      if (hit) return hit
+    }
+    return undefined
+  }
+
+  private async buildGroupMessageCountLookup(chatroomId: string): Promise<Map<string, number>> {
+    const lookup = new Map<string, number>()
+    const result = await wcdbService.getGroupStats(chatroomId, 0, 0)
+    if (!result.success || !result.data) return lookup
+
+    const sessionData = result.data?.sessions?.[chatroomId]
+    if (!sessionData || !sessionData.senders) return lookup
+
+    const idMap = result.data.idMap || {}
+    for (const [senderId, rawCount] of Object.entries(sessionData.senders as Record<string, number>)) {
+      const username = String(idMap[senderId] || senderId || '').trim()
+      if (!username) continue
+      const count = this.toNonNegativeInteger(rawCount)
+      const keys = this.buildIdCandidates([username])
+      for (const key of keys) {
+        const normalized = key.toLowerCase()
+        const prev = lookup.get(normalized) || 0
+        if (count > prev) {
+          lookup.set(normalized, count)
+        }
+      }
+    }
+    return lookup
+  }
+
+  private resolveMessageCountByCandidates(
+    lookup: Map<string, number>,
+    candidates: Array<string | undefined | null>
+  ): number {
+    let maxCount = 0
+    const ids = this.buildIdCandidates(candidates)
+    for (const id of ids) {
+      const count = lookup.get(id.toLowerCase())
+      if (typeof count === 'number' && count > maxCount) {
+        maxCount = count
+      }
+    }
+    return maxCount
+  }
+
+  private isFriendMember(wxid: string, contact?: GroupMemberContactInfo): boolean {
+    const normalizedWxid = String(wxid || '').trim().toLowerCase()
+    if (!normalizedWxid) return false
+    if (normalizedWxid.includes('@chatroom') || normalizedWxid.startsWith('gh_')) return false
+    if (this.friendExcludeNames.has(normalizedWxid)) return false
+    if (!contact) return false
+    return contact.localType === 1
+  }
+
+  private sortGroupMembersPanelEntries(members: GroupMembersPanelEntry[]): GroupMembersPanelEntry[] {
+    return members.sort((a, b) => {
+      const ownerDiff = Number(Boolean(b.isOwner)) - Number(Boolean(a.isOwner))
+      if (ownerDiff !== 0) return ownerDiff
+
+      const friendDiff = Number(Boolean(b.isFriend)) - Number(Boolean(a.isFriend))
+      if (friendDiff !== 0) return friendDiff
+
+      if (a.messageCount !== b.messageCount) return b.messageCount - a.messageCount
+      return a.displayName.localeCompare(b.displayName, 'zh-Hans-CN')
+    })
+  }
+
   private resolveGroupNicknameByCandidates(groupNicknames: Map<string, string>, candidates: string[]): string {
     const idCandidates = this.buildIdCandidates(candidates)
     if (idCandidates.length === 0) return ''
@@ -601,6 +784,138 @@ class GroupAnalyticsService {
 
       groups.sort((a, b) => b.memberCount - a.memberCount)
       return { success: true, data: groups }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  }
+
+  private async loadGroupMembersPanelDataFresh(
+    chatroomId: string
+  ): Promise<{ success: boolean; data?: GroupMembersPanelEntry[]; error?: string }> {
+    const membersResult = await wcdbService.getGroupMembers(chatroomId)
+    if (!membersResult.success || !membersResult.members) {
+      return { success: false, error: membersResult.error || '获取群成员失败' }
+    }
+
+    const members = membersResult.members as Array<{
+      username: string
+      avatarUrl?: string
+      originalName?: string
+      [key: string]: unknown
+    }>
+    if (members.length === 0) return { success: true, data: [] }
+
+    const usernames = members
+      .map((member) => String(member.username || '').trim())
+      .filter(Boolean)
+    if (usernames.length === 0) return { success: true, data: [] }
+
+    const displayNamesPromise = wcdbService.getDisplayNames(usernames)
+    const contactLookupPromise = this.buildGroupMemberContactLookup(usernames)
+    const ownerPromise = this.detectGroupOwnerUsername(chatroomId, members)
+    const messageCountLookupPromise = this.buildGroupMessageCountLookup(chatroomId)
+
+    const [displayNames, contactLookup, ownerUsername, messageCountLookup] = await Promise.all([
+      displayNamesPromise,
+      contactLookupPromise,
+      ownerPromise,
+      messageCountLookupPromise
+    ])
+
+    const nicknameCandidates = this.buildIdCandidates([
+      ...members.map((member) => member.username),
+      ...members.map((member) => member.originalName),
+      ...Array.from(contactLookup.values()).map((contact) => contact?.username),
+      ...Array.from(contactLookup.values()).map((contact) => contact?.userName),
+      ...Array.from(contactLookup.values()).map((contact) => contact?.encryptUsername),
+      ...Array.from(contactLookup.values()).map((contact) => contact?.encryptUserName),
+      ...Array.from(contactLookup.values()).map((contact) => contact?.alias)
+    ])
+    const groupNicknames = await this.getGroupNicknamesForRoom(chatroomId, nicknameCandidates)
+    const myWxid = this.cleanAccountDirName(this.configService.get('myWxid') || '')
+
+    const data: GroupMembersPanelEntry[] = members
+      .map((member) => {
+        const wxid = String(member.username || '').trim()
+        if (!wxid) return null
+
+        const contact = this.resolveContactByCandidates(contactLookup, [wxid, member.originalName])
+        const nickname = contact?.nickName || ''
+        const remark = contact?.remark || ''
+        const alias = contact?.alias || ''
+        const normalizedWxid = this.cleanAccountDirName(wxid)
+        const lookupCandidates = this.buildIdCandidates([
+          wxid,
+          member.originalName as string | undefined,
+          contact?.username,
+          contact?.userName,
+          contact?.encryptUsername,
+          contact?.encryptUserName,
+          alias
+        ])
+        if (normalizedWxid === myWxid) {
+          lookupCandidates.push(myWxid)
+        }
+        const groupNickname = this.resolveGroupNicknameByCandidates(groupNicknames, lookupCandidates)
+        const displayName = displayNames.success && displayNames.map ? (displayNames.map[wxid] || wxid) : wxid
+
+        return {
+          username: wxid,
+          displayName,
+          nickname,
+          alias,
+          remark,
+          groupNickname,
+          avatarUrl: member.avatarUrl,
+          isOwner: Boolean(ownerUsername && ownerUsername === wxid),
+          isFriend: this.isFriendMember(wxid, contact),
+          messageCount: this.resolveMessageCountByCandidates(messageCountLookup, lookupCandidates)
+        }
+      })
+      .filter((member): member is GroupMembersPanelEntry => Boolean(member))
+
+    return { success: true, data: this.sortGroupMembersPanelEntries(data) }
+  }
+
+  async getGroupMembersPanelData(
+    chatroomId: string,
+    forceRefresh: boolean = false
+  ): Promise<{ success: boolean; data?: GroupMembersPanelEntry[]; error?: string; fromCache?: boolean; updatedAt?: number }> {
+    try {
+      const normalizedChatroomId = String(chatroomId || '').trim()
+      if (!normalizedChatroomId) return { success: false, error: '群聊ID不能为空' }
+
+      const cacheKey = this.buildGroupMembersPanelCacheKey(normalizedChatroomId)
+      const now = Date.now()
+      const cached = this.groupMembersPanelCache.get(cacheKey)
+      if (!forceRefresh && cached && now - cached.updatedAt < this.groupMembersPanelCacheTtlMs) {
+        return { success: true, data: cached.data, fromCache: true, updatedAt: cached.updatedAt }
+      }
+
+      if (!forceRefresh) {
+        const pending = this.groupMembersPanelInFlight.get(cacheKey)
+        if (pending) return pending
+      }
+
+      const requestPromise = (async () => {
+        const conn = await this.ensureConnected()
+        if (!conn.success) return { success: false, error: conn.error }
+
+        const fresh = await this.loadGroupMembersPanelDataFresh(normalizedChatroomId)
+        if (!fresh.success || !fresh.data) {
+          return { success: false, error: fresh.error || '获取群成员面板数据失败' }
+        }
+
+        const updatedAt = Date.now()
+        this.groupMembersPanelCache.set(cacheKey, { updatedAt, data: fresh.data })
+        this.pruneGroupMembersPanelCache()
+        return { success: true, data: fresh.data, fromCache: false, updatedAt }
+      })().finally(() => {
+        this.groupMembersPanelInFlight.delete(cacheKey)
+      })
+
+      this.groupMembersPanelInFlight.set(cacheKey, requestPromise)
+      return await requestPromise
     } catch (e) {
       return { success: false, error: String(e) }
     }

@@ -378,6 +378,17 @@ const formatYmdDateFromSeconds = (timestamp?: number): string => {
   return `${y}-${m}-${day}`
 }
 
+const formatYmdHmDateTime = (timestamp?: number): string => {
+  if (!timestamp || !Number.isFinite(timestamp)) return '—'
+  const d = new Date(timestamp)
+  const y = d.getFullYear()
+  const m = `${d.getMonth() + 1}`.padStart(2, '0')
+  const day = `${d.getDate()}`.padStart(2, '0')
+  const h = `${d.getHours()}`.padStart(2, '0')
+  const min = `${d.getMinutes()}`.padStart(2, '0')
+  return `${y}-${m}-${day} ${h}:${min}`
+}
+
 const formatRecentExportTime = (timestamp?: number, now = Date.now()): string => {
   if (!timestamp) return ''
   const diff = Math.max(0, now - timestamp)
@@ -496,9 +507,34 @@ interface SessionDetail {
   groupMyMessages?: number
   groupActiveSpeakers?: number
   groupMutualFriends?: number
+  relationStatsLoaded?: boolean
+  statsUpdatedAt?: number
+  statsStale?: boolean
   firstMessageTime?: number
   latestMessageTime?: number
   messageTables: { dbName: string; tableName: string; count: number }[]
+}
+
+interface SessionExportMetric {
+  totalMessages: number
+  voiceMessages: number
+  imageMessages: number
+  videoMessages: number
+  emojiMessages: number
+  firstTimestamp?: number
+  lastTimestamp?: number
+  privateMutualGroups?: number
+  groupMemberCount?: number
+  groupMyMessages?: number
+  groupActiveSpeakers?: number
+  groupMutualFriends?: number
+}
+
+interface SessionExportCacheMeta {
+  updatedAt: number
+  stale: boolean
+  includeRelations: boolean
+  source: 'memory' | 'disk' | 'fresh'
 }
 
 const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number): Promise<T | null> => {
@@ -772,6 +808,8 @@ function ExportPage() {
   const [sessionDetail, setSessionDetail] = useState<SessionDetail | null>(null)
   const [isLoadingSessionDetail, setIsLoadingSessionDetail] = useState(false)
   const [isLoadingSessionDetailExtra, setIsLoadingSessionDetailExtra] = useState(false)
+  const [isRefreshingSessionDetailStats, setIsRefreshingSessionDetailStats] = useState(false)
+  const [isLoadingSessionRelationStats, setIsLoadingSessionRelationStats] = useState(false)
   const [copiedDetailField, setCopiedDetailField] = useState<string | null>(null)
 
   const [exportFolder, setExportFolder] = useState('')
@@ -1718,6 +1756,7 @@ function ExportPage() {
           next.exportVoices = payload.contentType === 'voice'
           next.exportVideos = payload.contentType === 'video'
           next.exportEmojis = payload.contentType === 'emoji'
+          next.exportVoiceAsText = false
         }
       }
 
@@ -1813,6 +1852,7 @@ function ExportPage() {
       if (contentType === 'text') {
         return {
           ...base,
+          contentType,
           exportAvatars: true,
           exportMedia: false,
           exportImages: false,
@@ -1824,11 +1864,13 @@ function ExportPage() {
 
       return {
         ...base,
+        contentType,
         exportMedia: true,
         exportImages: contentType === 'image',
         exportVoices: contentType === 'voice',
         exportVideos: contentType === 'video',
-        exportEmojis: contentType === 'emoji'
+        exportEmojis: contentType === 'emoji',
+        exportVoiceAsText: false
       }
     }
 
@@ -2048,6 +2090,8 @@ function ExportPage() {
           }))
         } else {
           const doneAt = Date.now()
+          const successCount = result.successCount ?? 0
+          const failCount = result.failCount ?? 0
           const contentTypes = next.payload.contentType
             ? [next.payload.contentType]
             : inferContentTypesFromOptions(next.payload.options)
@@ -2063,16 +2107,16 @@ function ExportPage() {
             updateTask(next.id, task => ({
               ...task,
               status: 'stopped',
-              controlState: undefined,
-              finishedAt: doneAt,
-              progress: {
-                ...task.progress,
-                current: result.successCount + result.failCount,
-                total: task.progress.total || next.payload.sessionIds.length,
-                phaseLabel: '已停止'
-              },
-              performance: finalizeTaskPerformance(task, doneAt)
-            }))
+                controlState: undefined,
+                finishedAt: doneAt,
+                progress: {
+                  ...task.progress,
+                  current: successCount + failCount,
+                  total: task.progress.total || next.payload.sessionIds.length,
+                  phaseLabel: '已停止'
+                },
+                performance: finalizeTaskPerformance(task, doneAt)
+              }))
           } else if (result.paused) {
             const pendingSessionIds = Array.isArray(result.pendingSessionIds)
               ? result.pendingSessionIds
@@ -2112,7 +2156,7 @@ function ExportPage() {
                 },
                 progress: {
                   ...task.progress,
-                  current: result.successCount + result.failCount,
+                  current: successCount + failCount,
                   total: task.progress.total || next.payload.sessionIds.length,
                   phaseLabel: '已暂停'
                 },
@@ -2531,6 +2575,40 @@ function ExportPage() {
     return map
   }, [contactsList])
 
+  const applySessionDetailStats = useCallback((
+    sessionId: string,
+    metric: SessionExportMetric,
+    cacheMeta?: SessionExportCacheMeta,
+    relationLoadedOverride?: boolean
+  ) => {
+    setSessionDetail((prev) => {
+      if (!prev || prev.wxid !== sessionId) return prev
+      const relationLoaded = relationLoadedOverride ?? Boolean(prev.relationStatsLoaded)
+      return {
+        ...prev,
+        messageCount: Number.isFinite(metric.totalMessages) ? metric.totalMessages : prev.messageCount,
+        voiceMessages: Number.isFinite(metric.voiceMessages) ? metric.voiceMessages : prev.voiceMessages,
+        imageMessages: Number.isFinite(metric.imageMessages) ? metric.imageMessages : prev.imageMessages,
+        videoMessages: Number.isFinite(metric.videoMessages) ? metric.videoMessages : prev.videoMessages,
+        emojiMessages: Number.isFinite(metric.emojiMessages) ? metric.emojiMessages : prev.emojiMessages,
+        groupMemberCount: Number.isFinite(metric.groupMemberCount) ? metric.groupMemberCount : prev.groupMemberCount,
+        groupMyMessages: Number.isFinite(metric.groupMyMessages) ? metric.groupMyMessages : prev.groupMyMessages,
+        groupActiveSpeakers: Number.isFinite(metric.groupActiveSpeakers) ? metric.groupActiveSpeakers : prev.groupActiveSpeakers,
+        privateMutualGroups: relationLoaded && Number.isFinite(metric.privateMutualGroups)
+          ? metric.privateMutualGroups
+          : prev.privateMutualGroups,
+        groupMutualFriends: relationLoaded && Number.isFinite(metric.groupMutualFriends)
+          ? metric.groupMutualFriends
+          : prev.groupMutualFriends,
+        relationStatsLoaded: relationLoaded,
+        statsUpdatedAt: cacheMeta?.updatedAt ?? prev.statsUpdatedAt,
+        statsStale: typeof cacheMeta?.stale === 'boolean' ? cacheMeta.stale : prev.statsStale,
+        firstMessageTime: Number.isFinite(metric.firstTimestamp) ? metric.firstTimestamp : prev.firstMessageTime,
+        latestMessageTime: Number.isFinite(metric.lastTimestamp) ? metric.lastTimestamp : prev.latestMessageTime
+      }
+    })
+  }, [])
+
   const loadSessionDetail = useCallback(async (sessionId: string) => {
     const normalizedSessionId = String(sessionId || '').trim()
     if (!normalizedSessionId) return
@@ -2543,6 +2621,8 @@ function ExportPage() {
       : undefined
 
     setCopiedDetailField(null)
+    setIsRefreshingSessionDetailStats(false)
+    setIsLoadingSessionRelationStats(false)
     setSessionDetail((prev) => {
       const sameSession = prev?.wxid === normalizedSessionId
       return {
@@ -2562,6 +2642,9 @@ function ExportPage() {
         groupMyMessages: sameSession ? prev?.groupMyMessages : undefined,
         groupActiveSpeakers: sameSession ? prev?.groupActiveSpeakers : undefined,
         groupMutualFriends: sameSession ? prev?.groupMutualFriends : undefined,
+        relationStatsLoaded: sameSession ? prev?.relationStatsLoaded : false,
+        statsUpdatedAt: sameSession ? prev?.statsUpdatedAt : undefined,
+        statsStale: sameSession ? prev?.statsStale : undefined,
         firstMessageTime: sameSession ? prev?.firstMessageTime : undefined,
         latestMessageTime: sameSession ? prev?.latestMessageTime : undefined,
         messageTables: sameSession && Array.isArray(prev?.messageTables) ? prev.messageTables : []
@@ -2591,6 +2674,9 @@ function ExportPage() {
           groupMyMessages: prev?.groupMyMessages,
           groupActiveSpeakers: prev?.groupActiveSpeakers,
           groupMutualFriends: prev?.groupMutualFriends,
+          relationStatsLoaded: prev?.relationStatsLoaded,
+          statsUpdatedAt: prev?.statsUpdatedAt,
+          statsStale: prev?.statsStale,
           firstMessageTime: prev?.firstMessageTime,
           latestMessageTime: prev?.latestMessageTime,
           messageTables: Array.isArray(prev?.messageTables) ? (prev?.messageTables || []) : []
@@ -2607,47 +2693,82 @@ function ExportPage() {
     try {
       const [extraResultSettled, statsResultSettled] = await Promise.allSettled([
         window.electronAPI.chat.getSessionDetailExtra(normalizedSessionId),
-        window.electronAPI.chat.getExportSessionStats([normalizedSessionId])
+        window.electronAPI.chat.getExportSessionStats(
+          [normalizedSessionId],
+          { includeRelations: false, allowStaleCache: true }
+        )
       ])
 
       if (requestSeq !== detailRequestSeqRef.current) return
 
-      setSessionDetail((prev) => {
-        if (!prev || prev.wxid !== normalizedSessionId) return prev
-
-        let next = { ...prev }
-        if (extraResultSettled.status === 'fulfilled' && extraResultSettled.value.success && extraResultSettled.value.detail) {
-          next = {
-            ...next,
-            firstMessageTime: extraResultSettled.value.detail.firstMessageTime,
-            latestMessageTime: extraResultSettled.value.detail.latestMessageTime,
-            messageTables: Array.isArray(extraResultSettled.value.detail.messageTables) ? extraResultSettled.value.detail.messageTables : []
-          }
+      if (extraResultSettled.status === 'fulfilled' && extraResultSettled.value.success) {
+        const detail = extraResultSettled.value.detail
+        if (detail) {
+          setSessionDetail((prev) => {
+            if (!prev || prev.wxid !== normalizedSessionId) return prev
+            return {
+              ...prev,
+              firstMessageTime: detail.firstMessageTime,
+              latestMessageTime: detail.latestMessageTime,
+              messageTables: Array.isArray(detail.messageTables) ? detail.messageTables : []
+            }
+          })
         }
+      }
 
-        if (statsResultSettled.status === 'fulfilled' && statsResultSettled.value.success && statsResultSettled.value.data) {
-          const metric = statsResultSettled.value.data[normalizedSessionId]
-          if (metric) {
-            next = {
-              ...next,
-              messageCount: Number.isFinite(metric.totalMessages) ? metric.totalMessages : next.messageCount,
-              voiceMessages: metric.voiceMessages,
-              imageMessages: metric.imageMessages,
-              videoMessages: metric.videoMessages,
-              emojiMessages: metric.emojiMessages,
-              privateMutualGroups: metric.privateMutualGroups,
-              groupMemberCount: metric.groupMemberCount,
-              groupMyMessages: metric.groupMyMessages,
-              groupActiveSpeakers: metric.groupActiveSpeakers,
-              groupMutualFriends: metric.groupMutualFriends,
-              firstMessageTime: Number.isFinite(metric.firstTimestamp) ? metric.firstTimestamp : next.firstMessageTime,
-              latestMessageTime: Number.isFinite(metric.lastTimestamp) ? metric.lastTimestamp : next.latestMessageTime
+      let refreshIncludeRelations = false
+      let shouldRefreshStats = false
+      if (statsResultSettled.status === 'fulfilled' && statsResultSettled.value.success) {
+        const metric = statsResultSettled.value.data?.[normalizedSessionId] as SessionExportMetric | undefined
+        const cacheMeta = statsResultSettled.value.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
+        refreshIncludeRelations = Boolean(cacheMeta?.includeRelations)
+        if (metric) {
+          applySessionDetailStats(normalizedSessionId, metric, cacheMeta, refreshIncludeRelations)
+        } else if (cacheMeta) {
+          setSessionDetail((prev) => {
+            if (!prev || prev.wxid !== normalizedSessionId) return prev
+            return {
+              ...prev,
+              relationStatsLoaded: refreshIncludeRelations || prev.relationStatsLoaded,
+              statsUpdatedAt: cacheMeta.updatedAt,
+              statsStale: cacheMeta.stale
+            }
+          })
+        }
+        shouldRefreshStats = Array.isArray(statsResultSettled.value.needsRefresh) &&
+          statsResultSettled.value.needsRefresh.includes(normalizedSessionId)
+      }
+
+      if (shouldRefreshStats) {
+        setIsRefreshingSessionDetailStats(true)
+        void (async () => {
+          try {
+            const freshResult = await window.electronAPI.chat.getExportSessionStats(
+              [normalizedSessionId],
+              { includeRelations: refreshIncludeRelations, forceRefresh: true }
+            )
+            if (requestSeq !== detailRequestSeqRef.current) return
+            if (freshResult.success && freshResult.data) {
+              const metric = freshResult.data[normalizedSessionId] as SessionExportMetric | undefined
+              const cacheMeta = freshResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
+              if (metric) {
+                applySessionDetailStats(
+                  normalizedSessionId,
+                  metric,
+                  cacheMeta,
+                  refreshIncludeRelations ? true : undefined
+                )
+              }
+            }
+          } catch (error) {
+            console.error('导出页刷新会话统计失败:', error)
+          } finally {
+            if (requestSeq === detailRequestSeqRef.current) {
+              setIsRefreshingSessionDetailStats(false)
             }
           }
-        }
-
-        return next
-      })
+        })()
+      }
     } catch (error) {
       console.error('导出页加载会话详情补充统计失败:', error)
     } finally {
@@ -2655,7 +2776,77 @@ function ExportPage() {
         setIsLoadingSessionDetailExtra(false)
       }
     }
-  }, [contactByUsername, sessionRowByUsername])
+  }, [applySessionDetailStats, contactByUsername, sessionRowByUsername])
+
+  const loadSessionRelationStats = useCallback(async () => {
+    const normalizedSessionId = String(sessionDetail?.wxid || '').trim()
+    if (!normalizedSessionId || isLoadingSessionRelationStats) return
+
+    const requestSeq = detailRequestSeqRef.current
+    setIsLoadingSessionRelationStats(true)
+    try {
+      const relationResult = await window.electronAPI.chat.getExportSessionStats(
+        [normalizedSessionId],
+        { includeRelations: true, allowStaleCache: true }
+      )
+      if (requestSeq !== detailRequestSeqRef.current) return
+
+      const metric = relationResult.success && relationResult.data
+        ? relationResult.data[normalizedSessionId] as SessionExportMetric | undefined
+        : undefined
+      const cacheMeta = relationResult.success
+        ? relationResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
+        : undefined
+      if (metric) {
+        applySessionDetailStats(normalizedSessionId, metric, cacheMeta, true)
+      }
+
+      const needRefresh = relationResult.success &&
+        Array.isArray(relationResult.needsRefresh) &&
+        relationResult.needsRefresh.includes(normalizedSessionId)
+
+      if (needRefresh) {
+        setIsRefreshingSessionDetailStats(true)
+        void (async () => {
+          try {
+            const freshResult = await window.electronAPI.chat.getExportSessionStats(
+              [normalizedSessionId],
+              { includeRelations: true, forceRefresh: true }
+            )
+            if (requestSeq !== detailRequestSeqRef.current) return
+            if (freshResult.success && freshResult.data) {
+              const freshMetric = freshResult.data[normalizedSessionId] as SessionExportMetric | undefined
+              const freshMeta = freshResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
+              if (freshMetric) {
+                applySessionDetailStats(normalizedSessionId, freshMetric, freshMeta, true)
+              }
+            }
+          } catch (error) {
+            console.error('导出页刷新会话关系统计失败:', error)
+          } finally {
+            if (requestSeq === detailRequestSeqRef.current) {
+              setIsRefreshingSessionDetailStats(false)
+            }
+          }
+        })()
+      }
+    } catch (error) {
+      console.error('导出页加载会话关系统计失败:', error)
+    } finally {
+      if (requestSeq === detailRequestSeqRef.current) {
+        setIsLoadingSessionRelationStats(false)
+      }
+    }
+  }, [applySessionDetailStats, isLoadingSessionRelationStats, sessionDetail?.wxid])
+
+  const closeSessionDetailPanel = useCallback(() => {
+    detailRequestSeqRef.current += 1
+    setShowSessionDetailPanel(false)
+    setIsLoadingSessionDetail(false)
+    setIsLoadingSessionDetailExtra(false)
+    setIsRefreshingSessionDetailStats(false)
+    setIsLoadingSessionRelationStats(false)
+  }, [])
 
   const openSessionDetail = useCallback((sessionId: string) => {
     if (!sessionId) return
@@ -2667,12 +2858,12 @@ function ExportPage() {
     if (!showSessionDetailPanel) return
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
-        setShowSessionDetailPanel(false)
+        closeSessionDetailPanel()
       }
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [showSessionDetailPanel])
+  }, [closeSessionDetailPanel, showSessionDetailPanel])
 
   const handleCopyDetailField = useCallback(async (text: string, field: string) => {
     try {
@@ -3421,7 +3612,7 @@ function ExportPage() {
           {showSessionDetailPanel && (
             <div
               className="export-session-detail-overlay"
-              onClick={() => setShowSessionDetailPanel(false)}
+              onClick={closeSessionDetailPanel}
             >
               <aside
                 className="export-session-detail-panel"
@@ -3444,7 +3635,7 @@ function ExportPage() {
                     <div className="detail-header-id">{sessionDetail?.wxid || ''}</div>
                   </div>
                 </div>
-                <button className="close-btn" onClick={() => setShowSessionDetailPanel(false)}>
+                <button className="close-btn" onClick={closeSessionDetailPanel}>
                   <X size={16} />
                 </button>
               </div>
@@ -3497,6 +3688,13 @@ function ExportPage() {
                     <div className="section-title">
                       <MessageSquare size={14} />
                       <span>消息统计（导出口径）</span>
+                    </div>
+                    <div className="detail-stats-meta">
+                      {isRefreshingSessionDetailStats
+                        ? '统计刷新中...'
+                        : sessionDetail.statsUpdatedAt
+                          ? `${sessionDetail.statsStale ? '缓存于' : '更新于'} ${formatYmdHmDateTime(sessionDetail.statsUpdatedAt)}${sessionDetail.statsStale ? '（将后台刷新）' : ''}`
+                          : (isLoadingSessionDetailExtra ? '统计加载中...' : '暂无统计缓存')}
                     </div>
                     <div className="detail-item">
                       <span className="label">消息总数</span>
@@ -3567,9 +3765,19 @@ function ExportPage() {
                         <div className="detail-item">
                           <span className="label">群共同好友数</span>
                           <span className="value">
-                            {Number.isFinite(sessionDetail.groupMutualFriends)
-                              ? (sessionDetail.groupMutualFriends as number).toLocaleString()
-                              : (isLoadingSessionDetailExtra ? '统计中...' : '—')}
+                            {sessionDetail.relationStatsLoaded
+                              ? (Number.isFinite(sessionDetail.groupMutualFriends)
+                                ? (sessionDetail.groupMutualFriends as number).toLocaleString()
+                                : '—')
+                              : (
+                                <button
+                                  className="detail-inline-btn"
+                                  onClick={() => { void loadSessionRelationStats() }}
+                                  disabled={isLoadingSessionRelationStats || isLoadingSessionDetailExtra}
+                                >
+                                  {isLoadingSessionRelationStats ? '加载中...' : '点击加载'}
+                                </button>
+                              )}
                           </span>
                         </div>
                       </>
@@ -3577,9 +3785,19 @@ function ExportPage() {
                       <div className="detail-item">
                         <span className="label">共同群聊数</span>
                         <span className="value">
-                          {Number.isFinite(sessionDetail.privateMutualGroups)
-                            ? (sessionDetail.privateMutualGroups as number).toLocaleString()
-                            : (isLoadingSessionDetailExtra ? '统计中...' : '—')}
+                          {sessionDetail.relationStatsLoaded
+                            ? (Number.isFinite(sessionDetail.privateMutualGroups)
+                              ? (sessionDetail.privateMutualGroups as number).toLocaleString()
+                              : '—')
+                            : (
+                              <button
+                                className="detail-inline-btn"
+                                onClick={() => { void loadSessionRelationStats() }}
+                                disabled={isLoadingSessionRelationStats || isLoadingSessionDetailExtra}
+                              >
+                                {isLoadingSessionRelationStats ? '加载中...' : '点击加载'}
+                              </button>
+                            )}
                         </span>
                       </div>
                     )}

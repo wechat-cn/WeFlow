@@ -1411,6 +1411,13 @@
       text-transform: uppercase;
       letter-spacing: 0.4px;
     }
+
+    .detail-stats-meta {
+      margin-top: -4px;
+      margin-bottom: 10px;
+      font-size: 12px;
+      color: var(--text-tertiary);
+    }
   }
 
   .detail-item {
@@ -1440,6 +1447,26 @@
       &.highlight {
         color: var(--primary);
         font-weight: 600;
+      }
+    }
+
+    .detail-inline-btn {
+      border: none;
+      background: var(--bg-secondary);
+      color: var(--primary);
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 12px;
+      line-height: 1;
+      cursor: pointer;
+
+      &:disabled {
+        cursor: not-allowed;
+        opacity: 0.7;
+      }
+
+      &:hover:not(:disabled) {
+        background: var(--bg-hover);
       }
     }
 

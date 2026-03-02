@@ -449,10 +449,10 @@ export default function SnsPage() {
                 const snsPostCountMap = new Map<string, number>(
                     Object.entries(snsCountsResult.data).map(([username, count]) => [username, Math.max(0, Number(count || 0))])
                 )
-                const contactsWithCounts = contactsList.map(contact => ({
+                const contactsWithCounts: Contact[] = contactsList.map(contact => ({
                     ...contact,
                     postCount: snsPostCountMap.get(contact.username) ?? 0,
-                    postCountStatus: 'ready'
+                    postCountStatus: 'ready' as const
                 }))
                 setContacts(contactsWithCounts)
 

@@ -1024,8 +1024,12 @@ function registerIpcHandlers() {
     return chatService.getSessionDetailExtra(sessionId)
   })
 
-  ipcMain.handle('chat:getExportSessionStats', async (_, sessionIds: string[]) => {
-    return chatService.getExportSessionStats(sessionIds)
+  ipcMain.handle('chat:getExportSessionStats', async (_, sessionIds: string[], options?: {
+    includeRelations?: boolean
+    forceRefresh?: boolean
+    allowStaleCache?: boolean
+  }) => {
+    return chatService.getExportSessionStats(sessionIds, options)
   })
 
   ipcMain.handle('chat:getImageData', async (_, sessionId: string, msgId: string) => {
@@ -1392,6 +1396,10 @@ function registerIpcHandlers() {
 
   ipcMain.handle('groupAnalytics:getGroupMembers', async (_, chatroomId: string) => {
     return groupAnalyticsService.getGroupMembers(chatroomId)
+  })
+
+  ipcMain.handle('groupAnalytics:getGroupMembersPanelData', async (_, chatroomId: string, forceRefresh?: boolean) => {
+    return groupAnalyticsService.getGroupMembersPanelData(chatroomId, forceRefresh)
   })
 
   ipcMain.handle('groupAnalytics:getGroupMessageRanking', async (_, chatroomId: string, limit?: number, startTime?: number, endTime?: number) => {

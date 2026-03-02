@@ -48,9 +48,18 @@ export interface ElectronAPI {
     onDownloadProgress: (callback: (progress: number) => void) => () => void
     onUpdateAvailable: (callback: (info: { version: string; releaseNotes: string }) => void) => () => void
   }
+  notification: {
+    show: (data: { title: string; content: string; avatarUrl?: string; sessionId: string }) => Promise<{ success?: boolean; error?: string } | void>
+    close: () => Promise<void>
+    click: (sessionId: string) => void
+    ready: () => void
+    resize: (width: number, height: number) => void
+    onShow: (callback: (event: any, data: any) => void) => () => void
+  }
   log: {
     getPath: () => Promise<string>
     read: () => Promise<{ success: boolean; content?: string; error?: string }>
+    debug: (data: any) => void
   }
   dbPath: {
     autoDetect: () => Promise<{ success: boolean; path?: string; error?: string }>
@@ -125,6 +134,11 @@ export interface ElectronAPI {
       messages?: Message[]
       error?: string
     }>
+    getCachedMessages: (sessionId: string) => Promise<{
+      success: boolean
+      messages?: Message[]
+      error?: string
+    }>
     getContact: (username: string) => Promise<Contact | null>
     getContactAvatar: (username: string) => Promise<{ avatarUrl?: string; displayName?: string } | null>
     updateMessage: (sessionId: string, localId: number, createTime: number, newContent: string) => Promise<{ success: boolean; error?: string }>
@@ -176,7 +190,10 @@ export interface ElectronAPI {
       }
       error?: string
     }>
-    getExportSessionStats: (sessionIds: string[]) => Promise<{
+    getExportSessionStats: (
+      sessionIds: string[],
+      options?: { includeRelations?: boolean; forceRefresh?: boolean; allowStaleCache?: boolean }
+    ) => Promise<{
       success: boolean
       data?: Record<string, {
         totalMessages: number
@@ -192,6 +209,13 @@ export interface ElectronAPI {
         groupActiveSpeakers?: number
         groupMutualFriends?: number
       }>
+      cache?: Record<string, {
+        updatedAt: number
+        stale: boolean
+        includeRelations: boolean
+        source: 'memory' | 'disk' | 'fresh'
+      }>
+      needsRefresh?: string[]
       error?: string
     }>
     getImageData: (sessionId: string, msgId: string) => Promise<{ success: boolean; data?: string; error?: string }>
@@ -211,7 +235,7 @@ export interface ElectronAPI {
   }
 
   image: {
-    decrypt: (payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; force?: boolean }) => Promise<{ success: boolean; localPath?: string; error?: string }>
+    decrypt: (payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; force?: boolean }) => Promise<{ success: boolean; localPath?: string; liveVideoPath?: string; error?: string }>
     resolveCache: (payload: { sessionId?: string; imageMd5?: string; imageDatName?: string }) => Promise<{ success: boolean; localPath?: string; hasUpdate?: boolean; liveVideoPath?: string; error?: string }>
     preload: (payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>) => Promise<boolean>
     onUpdateAvailable: (callback: (payload: { cacheKey: string; imageMd5?: string; imageDatName?: string }) => void) => () => void
@@ -325,6 +349,24 @@ export interface ElectronAPI {
         groupNickname?: string
         isOwner?: boolean
       }>
+      error?: string
+    }>
+    getGroupMembersPanelData: (chatroomId: string, forceRefresh?: boolean) => Promise<{
+      success: boolean
+      data?: Array<{
+        username: string
+        displayName: string
+        avatarUrl?: string
+        nickname?: string
+        alias?: string
+        remark?: string
+        groupNickname?: string
+        isOwner?: boolean
+        isFriend: boolean
+        messageCount: number
+      }>
+      fromCache?: boolean
+      updatedAt?: number
       error?: string
     }>
     getGroupMessageRanking: (chatroomId: string, limit?: number, startTime?: number, endTime?: number) => Promise<{
@@ -443,6 +485,20 @@ export interface ElectronAPI {
           phrase: string
           count: number
         }>
+        snsStats?: {
+          totalPosts: number
+          typeCounts?: Record<string, number>
+          topLikers: { username: string; displayName: string; avatarUrl?: string; count: number }[]
+          topLiked: { username: string; displayName: string; avatarUrl?: string; count: number }[]
+        }
+        lostFriend: {
+          username: string
+          displayName: string
+          avatarUrl?: string
+          earlyCount: number
+          lateCount: number
+          periodDesc: string
+        } | null
       }
       error?: string
     }>
@@ -498,15 +554,26 @@ export interface ElectronAPI {
           myTopEmojiMd5?: string
           friendTopEmojiMd5?: string
           myTopEmojiUrl?: string
+          friendTopEmojiUrl?: string
+          myTopEmojiCount?: number
+          friendTopEmojiCount?: number
           topPhrases: Array<{ phrase: string; count: number }>
           myExclusivePhrases: Array<{ phrase: string; count: number }>
           friendExclusivePhrases: Array<{ phrase: string; count: number }>
           heatmap?: number[][]
           initiative?: { initiated: number; received: number }
-          response?: { avg: number; fastest: number; count: number }
+          response?: { avg: number; fastest: number; slowest?: number; count: number }
           monthly?: Record<string, number>
           streak?: { days: number; startDate: string; endDate: string }
         }
+        topPhrases: Array<{ phrase: string; count: number }>
+        myExclusivePhrases: Array<{ phrase: string; count: number }>
+        friendExclusivePhrases: Array<{ phrase: string; count: number }>
+        heatmap?: number[][]
+        initiative?: { initiated: number; received: number }
+        response?: { avg: number; fastest: number; slowest?: number; count: number }
+        monthly?: Record<string, number>
+        streak?: { days: number; startDate: string; endDate: string }
       }
       error?: string
     }>
@@ -585,7 +652,7 @@ export interface ElectronAPI {
       error?: string
     }>
     debugResource: (url: string) => Promise<{ success: boolean; status?: number; headers?: any; error?: string }>
-    proxyImage: (payload: { url: string; key?: string | number }) => Promise<{ success: boolean; dataUrl?: string; error?: string }>
+    proxyImage: (payload: { url: string; key?: string | number }) => Promise<{ success: boolean; dataUrl?: string; videoPath?: string; error?: string }>
     downloadImage: (payload: { url: string; key?: string | number }) => Promise<{ success: boolean; data?: any; contentType?: string; error?: string }>
     exportTimeline: (options: {
       outputDir: string
@@ -618,6 +685,7 @@ export interface ElectronAPI {
 
 export interface ExportOptions {
   format: 'chatlab' | 'chatlab-jsonl' | 'json' | 'arkme-json' | 'html' | 'txt' | 'excel' | 'weclone' | 'sql'
+  contentType?: 'text' | 'voice' | 'image' | 'video' | 'emoji'
   dateRange?: { start: number; end: number } | null
   senderUsername?: string
   fileNameSuffix?: string

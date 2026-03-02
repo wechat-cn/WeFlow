@@ -157,7 +157,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getSessionDetail: (sessionId: string) => ipcRenderer.invoke('chat:getSessionDetail', sessionId),
     getSessionDetailFast: (sessionId: string) => ipcRenderer.invoke('chat:getSessionDetailFast', sessionId),
     getSessionDetailExtra: (sessionId: string) => ipcRenderer.invoke('chat:getSessionDetailExtra', sessionId),
-    getExportSessionStats: (sessionIds: string[]) => ipcRenderer.invoke('chat:getExportSessionStats', sessionIds),
+    getExportSessionStats: (
+      sessionIds: string[],
+      options?: { includeRelations?: boolean; forceRefresh?: boolean; allowStaleCache?: boolean }
+    ) => ipcRenderer.invoke('chat:getExportSessionStats', sessionIds, options),
     getImageData: (sessionId: string, msgId: string) => ipcRenderer.invoke('chat:getImageData', sessionId, msgId),
     getVoiceData: (sessionId: string, msgId: string, createTime?: number, serverId?: string | number) =>
       ipcRenderer.invoke('chat:getVoiceData', sessionId, msgId, createTime, serverId),
@@ -234,6 +237,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   groupAnalytics: {
     getGroupChats: () => ipcRenderer.invoke('groupAnalytics:getGroupChats'),
     getGroupMembers: (chatroomId: string) => ipcRenderer.invoke('groupAnalytics:getGroupMembers', chatroomId),
+    getGroupMembersPanelData: (chatroomId: string, forceRefresh?: boolean) =>
+      ipcRenderer.invoke('groupAnalytics:getGroupMembersPanelData', chatroomId, forceRefresh),
     getGroupMessageRanking: (chatroomId: string, limit?: number, startTime?: number, endTime?: number) => ipcRenderer.invoke('groupAnalytics:getGroupMessageRanking', chatroomId, limit, startTime, endTime),
     getGroupActiveHours: (chatroomId: string, startTime?: number, endTime?: number) => ipcRenderer.invoke('groupAnalytics:getGroupActiveHours', chatroomId, startTime, endTime),
     getGroupMediaStats: (chatroomId: string, startTime?: number, endTime?: number) => ipcRenderer.invoke('groupAnalytics:getGroupMediaStats', chatroomId, startTime, endTime),

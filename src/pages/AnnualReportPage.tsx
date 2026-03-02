@@ -23,10 +23,11 @@ function AnnualReportPage() {
     setLoadError(null)
     try {
       const result = await window.electronAPI.annualReport.getAvailableYears()
-      if (result.success && result.data && result.data.length > 0) {
-        setAvailableYears(result.data)
-        setSelectedYear((prev) => prev ?? result.data[0])
-        setSelectedPairYear((prev) => prev ?? result.data[0])
+      const years = result.data
+      if (result.success && Array.isArray(years) && years.length > 0) {
+        setAvailableYears(years)
+        setSelectedYear((prev) => prev ?? years[0])
+        setSelectedPairYear((prev) => prev ?? years[0])
       } else if (!result.success) {
         setLoadError(result.error || '加载年度数据失败')
       }

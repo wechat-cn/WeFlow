@@ -12,6 +12,7 @@ import { ConfigService } from './config'
 import { wcdbService } from './wcdbService'
 import { MessageCacheService } from './messageCacheService'
 import { ContactCacheService, ContactCacheEntry } from './contactCacheService'
+import { SessionStatsCacheService, SessionStatsCacheEntry, SessionStatsCacheStats } from './sessionStatsCacheService'
 import { voiceTranscribeService } from './voiceTranscribeService'
 import { LRUCache } from '../utils/LRUCache.js'
 
@@ -152,6 +153,19 @@ interface ExportSessionStats {
   groupMutualFriends?: number
 }
 
+interface ExportSessionStatsOptions {
+  includeRelations?: boolean
+  forceRefresh?: boolean
+  allowStaleCache?: boolean
+}
+
+interface ExportSessionStatsCacheMeta {
+  updatedAt: number
+  stale: boolean
+  includeRelations: boolean
+  source: 'memory' | 'disk' | 'fresh'
+}
+
 interface ExportTabCounts {
   private: number
   group: number
@@ -194,6 +208,7 @@ class ChatService {
   private hardlinkCache = new Map<string, HardlinkState>()
   private readonly contactCacheService: ContactCacheService
   private readonly messageCacheService: MessageCacheService
+  private readonly sessionStatsCacheService: SessionStatsCacheService
   private voiceWavCache: LRUCache<string, Buffer>
   private voiceTranscriptCache: LRUCache<string, string>
   private voiceTranscriptPending = new Map<string, Promise<{ success: boolean; transcript?: string; error?: string }>>()
@@ -225,6 +240,13 @@ class ChatService {
   private readonly sessionDetailExtraCacheTtlMs = 5 * 60 * 1000
   private sessionStatusCache = new Map<string, { isFolded?: boolean; isMuted?: boolean; updatedAt: number }>()
   private readonly sessionStatusCacheTtlMs = 10 * 60 * 1000
+  private sessionStatsCacheScope = ''
+  private sessionStatsMemoryCache = new Map<string, SessionStatsCacheEntry>()
+  private sessionStatsPendingBasic = new Map<string, Promise<ExportSessionStats>>()
+  private sessionStatsPendingFull = new Map<string, Promise<ExportSessionStats>>()
+  private allGroupSessionIdsCache: { ids: string[]; updatedAt: number } | null = null
+  private readonly sessionStatsCacheTtlMs = 10 * 60 * 1000
+  private readonly allGroupSessionIdsCacheTtlMs = 5 * 60 * 1000
 
   constructor() {
     this.configService = new ConfigService()
@@ -232,6 +254,7 @@ class ChatService {
     const persisted = this.contactCacheService.getAllEntries()
     this.avatarCache = new Map(Object.entries(persisted))
     this.messageCacheService = new MessageCacheService(this.configService.getCacheBasePath())
+    this.sessionStatsCacheService = new SessionStatsCacheService(this.configService.getCacheBasePath())
     // 初始化LRU缓存，限制大小防止内存泄漏
     this.voiceWavCache = new LRUCache(this.voiceWavCacheMaxEntries)
     this.voiceTranscriptCache = new LRUCache(1000) // 最多缓存1000条转写记录
@@ -319,6 +342,7 @@ class ChatService {
     // 使用 C++ DLL 内部的文件监控 (ReadDirectoryChangesW)
     // 这种方式更高效，且不占用 JS 线程，并能直接监听 session/message 目录变更
     wcdbService.setMonitor((type, json) => {
+      this.handleSessionStatsMonitorChange(type, json)
       // 广播给所有渲染进程窗口
       BrowserWindow.getAllWindows().forEach((win) => {
         if (!win.isDestroyed()) {
@@ -1558,13 +1582,212 @@ class ChatService {
     const dbPath = String(this.configService.get('dbPath') || '')
     const myWxid = String(this.configService.get('myWxid') || '')
     const scope = `${dbPath}::${myWxid}`
-    if (scope === this.sessionMessageCountCacheScope) return
+    if (scope === this.sessionMessageCountCacheScope) {
+      this.refreshSessionStatsCacheScope(scope)
+      return
+    }
     this.sessionMessageCountCacheScope = scope
     this.sessionMessageCountCache.clear()
     this.sessionMessageCountHintCache.clear()
     this.sessionDetailFastCache.clear()
     this.sessionDetailExtraCache.clear()
     this.sessionStatusCache.clear()
+    this.refreshSessionStatsCacheScope(scope)
+  }
+
+  private refreshSessionStatsCacheScope(scope: string): void {
+    if (scope === this.sessionStatsCacheScope) return
+    this.sessionStatsCacheScope = scope
+    this.sessionStatsMemoryCache.clear()
+    this.sessionStatsPendingBasic.clear()
+    this.sessionStatsPendingFull.clear()
+    this.allGroupSessionIdsCache = null
+  }
+
+  private buildScopedSessionStatsKey(sessionId: string): string {
+    return `${this.sessionStatsCacheScope}::${sessionId}`
+  }
+
+  private toSessionStatsCacheStats(stats: ExportSessionStats): SessionStatsCacheStats {
+    const normalized: SessionStatsCacheStats = {
+      totalMessages: Number.isFinite(stats.totalMessages) ? Math.max(0, Math.floor(stats.totalMessages)) : 0,
+      voiceMessages: Number.isFinite(stats.voiceMessages) ? Math.max(0, Math.floor(stats.voiceMessages)) : 0,
+      imageMessages: Number.isFinite(stats.imageMessages) ? Math.max(0, Math.floor(stats.imageMessages)) : 0,
+      videoMessages: Number.isFinite(stats.videoMessages) ? Math.max(0, Math.floor(stats.videoMessages)) : 0,
+      emojiMessages: Number.isFinite(stats.emojiMessages) ? Math.max(0, Math.floor(stats.emojiMessages)) : 0
+    }
+
+    if (Number.isFinite(stats.firstTimestamp)) normalized.firstTimestamp = Math.max(0, Math.floor(stats.firstTimestamp as number))
+    if (Number.isFinite(stats.lastTimestamp)) normalized.lastTimestamp = Math.max(0, Math.floor(stats.lastTimestamp as number))
+    if (Number.isFinite(stats.privateMutualGroups)) normalized.privateMutualGroups = Math.max(0, Math.floor(stats.privateMutualGroups as number))
+    if (Number.isFinite(stats.groupMemberCount)) normalized.groupMemberCount = Math.max(0, Math.floor(stats.groupMemberCount as number))
+    if (Number.isFinite(stats.groupMyMessages)) normalized.groupMyMessages = Math.max(0, Math.floor(stats.groupMyMessages as number))
+    if (Number.isFinite(stats.groupActiveSpeakers)) normalized.groupActiveSpeakers = Math.max(0, Math.floor(stats.groupActiveSpeakers as number))
+    if (Number.isFinite(stats.groupMutualFriends)) normalized.groupMutualFriends = Math.max(0, Math.floor(stats.groupMutualFriends as number))
+
+    return normalized
+  }
+
+  private fromSessionStatsCacheStats(stats: SessionStatsCacheStats): ExportSessionStats {
+    return {
+      totalMessages: stats.totalMessages,
+      voiceMessages: stats.voiceMessages,
+      imageMessages: stats.imageMessages,
+      videoMessages: stats.videoMessages,
+      emojiMessages: stats.emojiMessages,
+      firstTimestamp: stats.firstTimestamp,
+      lastTimestamp: stats.lastTimestamp,
+      privateMutualGroups: stats.privateMutualGroups,
+      groupMemberCount: stats.groupMemberCount,
+      groupMyMessages: stats.groupMyMessages,
+      groupActiveSpeakers: stats.groupActiveSpeakers,
+      groupMutualFriends: stats.groupMutualFriends
+    }
+  }
+
+  private supportsRequestedRelation(entry: SessionStatsCacheEntry, includeRelations: boolean): boolean {
+    if (!includeRelations) return true
+    return entry.includeRelations
+  }
+
+  private getSessionStatsCacheEntry(sessionId: string): { entry: SessionStatsCacheEntry; source: 'memory' | 'disk' } | null {
+    const scopedKey = this.buildScopedSessionStatsKey(sessionId)
+    const inMemory = this.sessionStatsMemoryCache.get(scopedKey)
+    if (inMemory) {
+      return { entry: inMemory, source: 'memory' }
+    }
+
+    const persisted = this.sessionStatsCacheService.get(this.sessionStatsCacheScope, sessionId)
+    if (!persisted) return null
+    this.sessionStatsMemoryCache.set(scopedKey, persisted)
+    return { entry: persisted, source: 'disk' }
+  }
+
+  private setSessionStatsCacheEntry(sessionId: string, stats: ExportSessionStats, includeRelations: boolean): number {
+    const updatedAt = Date.now()
+    const entry: SessionStatsCacheEntry = {
+      updatedAt,
+      includeRelations,
+      stats: this.toSessionStatsCacheStats(stats)
+    }
+    const scopedKey = this.buildScopedSessionStatsKey(sessionId)
+    this.sessionStatsMemoryCache.set(scopedKey, entry)
+    this.sessionStatsCacheService.set(this.sessionStatsCacheScope, sessionId, entry)
+    return updatedAt
+  }
+
+  private deleteSessionStatsCacheEntry(sessionId: string): void {
+    const scopedKey = this.buildScopedSessionStatsKey(sessionId)
+    this.sessionStatsMemoryCache.delete(scopedKey)
+    this.sessionStatsPendingBasic.delete(scopedKey)
+    this.sessionStatsPendingFull.delete(scopedKey)
+    this.sessionStatsCacheService.delete(this.sessionStatsCacheScope, sessionId)
+  }
+
+  private clearSessionStatsCacheForScope(): void {
+    this.sessionStatsMemoryCache.clear()
+    this.sessionStatsPendingBasic.clear()
+    this.sessionStatsPendingFull.clear()
+    this.allGroupSessionIdsCache = null
+    this.sessionStatsCacheService.clearScope(this.sessionStatsCacheScope)
+  }
+
+  private collectSessionIdsFromPayload(payload: unknown): Set<string> {
+    const ids = new Set<string>()
+    const walk = (value: unknown, keyHint?: string) => {
+      if (Array.isArray(value)) {
+        for (const item of value) walk(item, keyHint)
+        return
+      }
+      if (value && typeof value === 'object') {
+        for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+          walk(v, k)
+        }
+        return
+      }
+      if (typeof value !== 'string') return
+      const normalized = value.trim()
+      if (!normalized) return
+      const lowerKey = String(keyHint || '').toLowerCase()
+      const keyLooksLikeSession = (
+        lowerKey.includes('session') ||
+        lowerKey.includes('talker') ||
+        lowerKey.includes('username') ||
+        lowerKey.includes('chatroom')
+      )
+      if (!keyLooksLikeSession && !normalized.includes('@chatroom')) {
+        return
+      }
+      ids.add(normalized)
+    }
+    walk(payload)
+    return ids
+  }
+
+  private handleSessionStatsMonitorChange(type: string, json: string): void {
+    this.refreshSessionMessageCountCacheScope()
+    if (!this.sessionStatsCacheScope) return
+
+    const normalizedType = String(type || '').toLowerCase()
+    const maybeJson = String(json || '').trim()
+    let ids = new Set<string>()
+    if (maybeJson) {
+      try {
+        ids = this.collectSessionIdsFromPayload(JSON.parse(maybeJson))
+      } catch {
+        ids = this.collectSessionIdsFromPayload(maybeJson)
+      }
+    }
+
+    if (ids.size > 0) {
+      ids.forEach((sessionId) => this.deleteSessionStatsCacheEntry(sessionId))
+      if (Array.from(ids).some((id) => id.includes('@chatroom'))) {
+        this.allGroupSessionIdsCache = null
+      }
+      return
+    }
+
+    // 无法定位具体会话时，保守地仅在消息/群成员相关变更时清空当前 scope，避免展示过旧统计。
+    if (
+      normalizedType.includes('message') ||
+      normalizedType.includes('session') ||
+      normalizedType.includes('group') ||
+      normalizedType.includes('member') ||
+      normalizedType.includes('contact')
+    ) {
+      this.clearSessionStatsCacheForScope()
+    }
+  }
+
+  private async listAllGroupSessionIds(): Promise<string[]> {
+    const now = Date.now()
+    if (
+      this.allGroupSessionIdsCache &&
+      now - this.allGroupSessionIdsCache.updatedAt <= this.allGroupSessionIdsCacheTtlMs
+    ) {
+      return this.allGroupSessionIdsCache.ids
+    }
+
+    const result = await wcdbService.getSessions()
+    if (!result.success || !Array.isArray(result.sessions)) {
+      return []
+    }
+
+    const ids = new Set<string>()
+    for (const rowAny of result.sessions) {
+      const row = rowAny as Record<string, unknown>
+      const usernameRaw = row.username ?? row.userName ?? row.talker ?? row.sessionId
+      const username = String(usernameRaw || '').trim()
+      if (!username || !username.endsWith('@chatroom')) continue
+      ids.add(username)
+    }
+
+    const list = Array.from(ids)
+    this.allGroupSessionIdsCache = {
+      ids: list,
+      updatedAt: now
+    }
+    return list
   }
 
   private async collectSessionExportStats(
@@ -1713,6 +1936,95 @@ class ChatService {
     })
 
     return { privateMutualGroupMap, groupMutualFriendMap }
+  }
+
+  private buildEmptyExportSessionStats(sessionId: string, includeRelations: boolean): ExportSessionStats {
+    const isGroup = sessionId.endsWith('@chatroom')
+    const stats: ExportSessionStats = {
+      totalMessages: 0,
+      voiceMessages: 0,
+      imageMessages: 0,
+      videoMessages: 0,
+      emojiMessages: 0
+    }
+    if (isGroup) {
+      stats.groupMyMessages = 0
+      stats.groupActiveSpeakers = 0
+      stats.groupMemberCount = 0
+      if (includeRelations) {
+        stats.groupMutualFriends = 0
+      }
+    } else if (includeRelations) {
+      stats.privateMutualGroups = 0
+    }
+    return stats
+  }
+
+  private async computeSessionExportStats(
+    sessionId: string,
+    selfIdentitySet: Set<string>,
+    includeRelations: boolean
+  ): Promise<ExportSessionStats> {
+    const stats = await this.collectSessionExportStats(sessionId, selfIdentitySet)
+    const isGroup = sessionId.endsWith('@chatroom')
+
+    if (isGroup) {
+      const memberCountsResult = await wcdbService.getGroupMemberCounts([sessionId])
+      const memberCountMap = memberCountsResult.success && memberCountsResult.map ? memberCountsResult.map : {}
+      stats.groupMemberCount = typeof memberCountMap[sessionId] === 'number' ? Math.max(0, Math.floor(memberCountMap[sessionId])) : 0
+    }
+
+    if (includeRelations) {
+      if (isGroup) {
+        try {
+          const { groupMutualFriendMap } = await this.buildGroupRelationStats([sessionId], [], selfIdentitySet)
+          stats.groupMutualFriends = groupMutualFriendMap[sessionId] || 0
+        } catch {
+          stats.groupMutualFriends = 0
+        }
+      } else {
+        const allGroups = await this.listAllGroupSessionIds()
+        if (allGroups.length === 0) {
+          stats.privateMutualGroups = 0
+        } else {
+          try {
+            const { privateMutualGroupMap } = await this.buildGroupRelationStats(allGroups, [sessionId], selfIdentitySet)
+            stats.privateMutualGroups = privateMutualGroupMap[sessionId] || 0
+          } catch {
+            stats.privateMutualGroups = 0
+          }
+        }
+      }
+    }
+
+    return stats
+  }
+
+  private async getOrComputeSessionExportStats(
+    sessionId: string,
+    includeRelations: boolean,
+    selfIdentitySet: Set<string>
+  ): Promise<ExportSessionStats> {
+    const scopedKey = this.buildScopedSessionStatsKey(sessionId)
+
+    if (!includeRelations) {
+      const pendingFull = this.sessionStatsPendingFull.get(scopedKey)
+      if (pendingFull) return pendingFull
+      const pendingBasic = this.sessionStatsPendingBasic.get(scopedKey)
+      if (pendingBasic) return pendingBasic
+    } else {
+      const pendingFull = this.sessionStatsPendingFull.get(scopedKey)
+      if (pendingFull) return pendingFull
+    }
+
+    const targetMap = includeRelations ? this.sessionStatsPendingFull : this.sessionStatsPendingBasic
+    const pending = this.computeSessionExportStats(sessionId, selfIdentitySet, includeRelations)
+    targetMap.set(scopedKey, pending)
+    try {
+      return await pending
+    } finally {
+      targetMap.delete(scopedKey)
+    }
   }
 
   /**
@@ -3600,6 +3912,14 @@ class ChatService {
       this.voiceTranscriptPending.clear()
     }
 
+    if (includeMessages || includeContacts) {
+      this.sessionStatsMemoryCache.clear()
+      this.sessionStatsPendingBasic.clear()
+      this.sessionStatsPendingFull.clear()
+      this.allGroupSessionIdsCache = null
+      this.sessionStatsCacheService.clearAll()
+    }
+
     for (const state of this.hardlinkCache.values()) {
       try {
         state.db?.close()
@@ -4036,9 +4356,11 @@ class ChatService {
     }
   }
 
-  async getExportSessionStats(sessionIds: string[]): Promise<{
+  async getExportSessionStats(sessionIds: string[], options: ExportSessionStatsOptions = {}): Promise<{
     success: boolean
     data?: Record<string, ExportSessionStats>
+    cache?: Record<string, ExportSessionStatsCacheMeta>
+    needsRefresh?: string[]
     error?: string
   }> {
     try {
@@ -4046,6 +4368,11 @@ class ChatService {
       if (!connectResult.success) {
         return { success: false, error: connectResult.error || '数据库未连接' }
       }
+      this.refreshSessionMessageCountCacheScope()
+
+      const includeRelations = options.includeRelations ?? true
+      const forceRefresh = options.forceRefresh === true
+      const allowStaleCache = options.allowStaleCache === true
 
       const normalizedSessionIds = Array.from(
         new Set(
@@ -4055,83 +4382,76 @@ class ChatService {
         )
       )
       if (normalizedSessionIds.length === 0) {
-        return { success: true, data: {} }
+        return { success: true, data: {}, cache: {} }
       }
-
-      const myWxid = this.configService.get('myWxid') || ''
-      const selfIdentitySet = new Set<string>(this.buildIdentityKeys(myWxid))
 
       const resultMap: Record<string, ExportSessionStats> = {}
-      await this.forEachWithConcurrency(normalizedSessionIds, 3, async (sessionId) => {
-        try {
-          resultMap[sessionId] = await this.collectSessionExportStats(sessionId, selfIdentitySet)
-        } catch {
-          resultMap[sessionId] = {
-            totalMessages: 0,
-            voiceMessages: 0,
-            imageMessages: 0,
-            videoMessages: 0,
-            emojiMessages: 0
-          }
-        }
-      })
+      const cacheMeta: Record<string, ExportSessionStatsCacheMeta> = {}
+      const needsRefreshSet = new Set<string>()
+      const pendingSessionIds: string[] = []
+      const now = Date.now()
 
-      const groupSessionIds = normalizedSessionIds.filter((id) => id.endsWith('@chatroom'))
-      const privateSessionIds = normalizedSessionIds.filter((id) => !id.endsWith('@chatroom'))
-
-      for (const privateId of privateSessionIds) {
-        resultMap[privateId] = {
-          ...resultMap[privateId],
-          privateMutualGroups: resultMap[privateId]?.privateMutualGroups ?? 0
-        }
-      }
-      for (const groupId of groupSessionIds) {
-        resultMap[groupId] = {
-          ...resultMap[groupId],
-          groupMyMessages: resultMap[groupId]?.groupMyMessages ?? 0,
-          groupActiveSpeakers: resultMap[groupId]?.groupActiveSpeakers ?? 0,
-          groupMemberCount: resultMap[groupId]?.groupMemberCount ?? 0,
-          groupMutualFriends: resultMap[groupId]?.groupMutualFriends ?? 0
-        }
-      }
-
-      if (groupSessionIds.length > 0) {
-        const memberCountsResult = await wcdbService.getGroupMemberCounts(groupSessionIds)
-        const memberCountMap = memberCountsResult.success && memberCountsResult.map ? memberCountsResult.map : {}
-        for (const groupId of groupSessionIds) {
-          resultMap[groupId] = {
-            ...resultMap[groupId],
-            groupMemberCount: typeof memberCountMap[groupId] === 'number' ? memberCountMap[groupId] : 0
-          }
-        }
-      }
-
-      if (groupSessionIds.length > 0) {
-        try {
-          const { privateMutualGroupMap, groupMutualFriendMap } = await this.buildGroupRelationStats(
-            groupSessionIds,
-            privateSessionIds,
-            selfIdentitySet
-          )
-
-          for (const privateId of privateSessionIds) {
-            resultMap[privateId] = {
-              ...resultMap[privateId],
-              privateMutualGroups: privateMutualGroupMap[privateId] || 0
+      for (const sessionId of normalizedSessionIds) {
+        if (!forceRefresh) {
+          const cachedResult = this.getSessionStatsCacheEntry(sessionId)
+          if (cachedResult && this.supportsRequestedRelation(cachedResult.entry, includeRelations)) {
+            const stale = now - cachedResult.entry.updatedAt > this.sessionStatsCacheTtlMs
+            if (!stale || allowStaleCache) {
+              resultMap[sessionId] = this.fromSessionStatsCacheStats(cachedResult.entry.stats)
+              cacheMeta[sessionId] = {
+                updatedAt: cachedResult.entry.updatedAt,
+                stale,
+                includeRelations: cachedResult.entry.includeRelations,
+                source: cachedResult.source
+              }
+              if (stale) {
+                needsRefreshSet.add(sessionId)
+              }
+              continue
             }
           }
-          for (const groupId of groupSessionIds) {
-            resultMap[groupId] = {
-              ...resultMap[groupId],
-              groupMutualFriends: groupMutualFriendMap[groupId] || 0
-            }
+          if (allowStaleCache) {
+            needsRefreshSet.add(sessionId)
+            continue
           }
-        } catch {
-          // 群成员关系统计失败时保留默认值，避免影响主列表展示
         }
+        pendingSessionIds.push(sessionId)
       }
 
-      return { success: true, data: resultMap }
+      if (pendingSessionIds.length > 0) {
+        const myWxid = this.configService.get('myWxid') || ''
+        const selfIdentitySet = new Set<string>(this.buildIdentityKeys(myWxid))
+        await this.forEachWithConcurrency(pendingSessionIds, 3, async (sessionId) => {
+          try {
+            const stats = await this.getOrComputeSessionExportStats(sessionId, includeRelations, selfIdentitySet)
+            resultMap[sessionId] = stats
+            const updatedAt = this.setSessionStatsCacheEntry(sessionId, stats, includeRelations)
+            cacheMeta[sessionId] = {
+              updatedAt,
+              stale: false,
+              includeRelations,
+              source: 'fresh'
+            }
+          } catch {
+            resultMap[sessionId] = this.buildEmptyExportSessionStats(sessionId, includeRelations)
+          }
+        })
+      }
+
+      const response: {
+        success: boolean
+        data?: Record<string, ExportSessionStats>
+        cache?: Record<string, ExportSessionStatsCacheMeta>
+        needsRefresh?: string[]
+      } = {
+        success: true,
+        data: resultMap,
+        cache: cacheMeta
+      }
+      if (needsRefreshSet.size > 0) {
+        response.needsRefresh = Array.from(needsRefreshSet)
+      }
+      return response
     } catch (e) {
       console.error('ChatService: 获取导出会话统计失败:', e)
       return { success: false, error: String(e) }

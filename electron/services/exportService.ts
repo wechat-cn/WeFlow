@@ -70,6 +70,7 @@ const MESSAGE_TYPE_MAP: Record<number, number> = {
 
 export interface ExportOptions {
   format: 'chatlab' | 'chatlab-jsonl' | 'json' | 'arkme-json' | 'html' | 'txt' | 'excel' | 'weclone' | 'sql'
+  contentType?: 'text' | 'voice' | 'image' | 'video' | 'emoji'
   dateRange?: { start: number; end: number } | null
   senderUsername?: string
   fileNameSuffix?: string
@@ -103,6 +104,9 @@ interface MediaExportItem {
   kind: 'image' | 'voice' | 'emoji' | 'video'
   posterDataUrl?: string
 }
+
+type MessageCollectMode = 'full' | 'text-fast' | 'media-fast'
+type MediaContentType = 'voice' | 'image' | 'video' | 'emoji'
 
 export interface ExportProgress {
   current: number
@@ -157,6 +161,85 @@ class ExportService {
     if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
     const raw = Math.floor(value)
     return Math.max(1, Math.min(raw, max))
+  }
+
+  private isMediaExportEnabled(options: ExportOptions): boolean {
+    return options.exportMedia === true &&
+      Boolean(options.exportImages || options.exportVoices || options.exportVideos || options.exportEmojis)
+  }
+
+  private isUnboundedDateRange(dateRange?: { start: number; end: number } | null): boolean {
+    if (!dateRange) return true
+    const start = Number.isFinite(dateRange.start) ? dateRange.start : 0
+    const end = Number.isFinite(dateRange.end) ? dateRange.end : 0
+    return start <= 0 && end <= 0
+  }
+
+  private shouldUseFastTextCollection(options: ExportOptions): boolean {
+    // 文本批量导出优先走轻量采集：不做媒体字段预提取，减少 CPU 与内存占用
+    return !this.isMediaExportEnabled(options)
+  }
+
+  private getMediaContentType(options: ExportOptions): MediaContentType | null {
+    const value = options.contentType
+    if (value === 'voice' || value === 'image' || value === 'video' || value === 'emoji') {
+      return value
+    }
+    return null
+  }
+
+  private isMediaContentBatchExport(options: ExportOptions): boolean {
+    return this.getMediaContentType(options) !== null
+  }
+
+  private getTargetMediaLocalTypes(options: ExportOptions): Set<number> {
+    const mediaContentType = this.getMediaContentType(options)
+    if (mediaContentType === 'voice') return new Set([34])
+    if (mediaContentType === 'image') return new Set([3])
+    if (mediaContentType === 'video') return new Set([43])
+    if (mediaContentType === 'emoji') return new Set([47])
+
+    const selected = new Set<number>()
+    if (options.exportImages) selected.add(3)
+    if (options.exportVoices) selected.add(34)
+    if (options.exportVideos) selected.add(43)
+    if (options.exportEmojis) selected.add(47)
+    return selected
+  }
+
+  private resolveCollectMode(options: ExportOptions): MessageCollectMode {
+    if (this.isMediaContentBatchExport(options)) {
+      return 'media-fast'
+    }
+    return this.shouldUseFastTextCollection(options) ? 'text-fast' : 'full'
+  }
+
+  private resolveCollectParams(options: ExportOptions): { mode: MessageCollectMode; targetMediaTypes?: Set<number> } {
+    const mode = this.resolveCollectMode(options)
+    if (mode === 'media-fast') {
+      const targetMediaTypes = this.getTargetMediaLocalTypes(options)
+      if (targetMediaTypes.size > 0) {
+        return { mode, targetMediaTypes }
+      }
+    }
+    return { mode }
+  }
+
+  private shouldDecodeMessageContentInFastMode(localType: number): boolean {
+    // 这些类型在文本导出里只需要占位符，无需解码完整 XML / 压缩内容
+    if (localType === 3 || localType === 34 || localType === 42 || localType === 43 || localType === 47) {
+      return false
+    }
+    return true
+  }
+
+  private shouldDecodeMessageContentInMediaMode(localType: number, targetMediaTypes: Set<number> | null): boolean {
+    if (!targetMediaTypes || !targetMediaTypes.has(localType)) return false
+    // 语音导出仅需要 localId 读取音频数据，不依赖 XML 内容
+    if (localType === 34) return false
+    // 图片/视频/表情可能需要从 XML 提取 md5/datName/cdnUrl
+    if (localType === 3 || localType === 43 || localType === 47) return true
+    return false
   }
 
   private cleanAccountDirName(dirName: string): string {
@@ -1620,7 +1703,10 @@ class ExportService {
       }
 
       const msgId = String(msg.localId)
-      const fileName = `voice_${msgId}.wav`
+      const safeSession = this.cleanAccountDirName(sessionId)
+        .replace(/[^a-zA-Z0-9_-]/g, '_')
+        .slice(0, 48) || 'session'
+      const fileName = `voice_${safeSession}_${msgId}.wav`
       const destPath = path.join(voicesDir, fileName)
 
       // 如果已存在则跳过
@@ -1906,25 +1992,39 @@ class ExportService {
     sessionId: string,
     cleanedMyWxid: string,
     dateRange?: { start: number; end: number } | null,
-    senderUsernameFilter?: string
+    senderUsernameFilter?: string,
+    collectMode: MessageCollectMode = 'full',
+    targetMediaTypes?: Set<number>
   ): Promise<{ rows: any[]; memberSet: Map<string, { member: ChatLabMember; avatarUrl?: string }>; firstTime: number | null; lastTime: number | null }> {
     const rows: any[] = []
     const memberSet = new Map<string, { member: ChatLabMember; avatarUrl?: string }>()
     const senderSet = new Set<string>()
     let firstTime: number | null = null
     let lastTime: number | null = null
+    const mediaTypeFilter = collectMode === 'media-fast' && targetMediaTypes && targetMediaTypes.size > 0
+      ? targetMediaTypes
+      : null
 
     // 修复时间范围：0 表示不限制，而不是时间戳 0
     const beginTime = dateRange?.start || 0
     const endTime = dateRange?.end && dateRange.end > 0 ? dateRange.end : 0
     
-    const cursor = await wcdbService.openMessageCursor(
-      sessionId,
-      500,
-      true,
-      beginTime,
-      endTime
-    )
+    const batchSize = (collectMode === 'text-fast' || collectMode === 'media-fast') ? 2000 : 500
+    const cursor = collectMode === 'media-fast'
+      ? await wcdbService.openMessageCursorLite(
+        sessionId,
+        batchSize,
+        true,
+        beginTime,
+        endTime
+      )
+      : await wcdbService.openMessageCursor(
+        sessionId,
+        batchSize,
+        true,
+        beginTime,
+        endTime
+      )
     if (!cursor.success || !cursor.cursor) {
       console.error(`[Export] 打开游标失败: ${cursor.error || '未知错误'}`)
       return { rows, memberSet, firstTime, lastTime }
@@ -1950,8 +2050,16 @@ class ExportService {
             if (createTime < dateRange.start || createTime > dateRange.end) continue
           }
 
-          const content = this.decodeMessageContent(row.message_content, row.compress_content)
           const localType = parseInt(row.local_type || row.type || '1', 10)
+          if (mediaTypeFilter && !mediaTypeFilter.has(localType)) {
+            continue
+          }
+          const shouldDecodeContent = collectMode === 'full'
+            || (collectMode === 'text-fast' && this.shouldDecodeMessageContentInFastMode(localType))
+            || (collectMode === 'media-fast' && this.shouldDecodeMessageContentInMediaMode(localType, mediaTypeFilter))
+          const content = shouldDecodeContent
+            ? this.decodeMessageContent(row.message_content, row.compress_content)
+            : ''
           const senderUsername = row.sender_username || ''
           const isSendRaw = row.computed_is_send ?? row.is_send ?? '0'
           const isSend = parseInt(isSendRaw, 10) === 1
@@ -1987,7 +2095,7 @@ class ExportService {
           }
           senderSet.add(actualSender)
 
-          // 提取媒体相关字段
+          // 提取媒体相关字段（轻量模式下跳过）
           let imageMd5: string | undefined
           let imageDatName: string | undefined
           let emojiCdnUrl: string | undefined
@@ -1995,22 +2103,31 @@ class ExportService {
           let videoMd5: string | undefined
           let chatRecordList: any[] | undefined
 
-          if (localType === 3 && content) {
-            // 图片消息
-            imageMd5 = this.extractImageMd5(content)
-            imageDatName = this.extractImageDatName(content)
-          } else if (localType === 47 && content) {
-            // 动画表情
-            emojiCdnUrl = this.extractEmojiUrl(content)
-            emojiMd5 = this.extractEmojiMd5(content)
-          } else if (localType === 43 && content) {
-            // 视频消息
-            videoMd5 = this.extractVideoMd5(content)
-          } else if (localType === 49 && content) {
-            // 检查是否是聊天记录消息（type=19）
-            const xmlType = this.extractXmlValue(content, 'type')
-            if (xmlType === '19') {
-              chatRecordList = this.parseChatHistory(content)
+          if (collectMode === 'full' || collectMode === 'media-fast') {
+            // 优先复用游标返回的字段，缺失时再回退到 XML 解析。
+            imageMd5 = String(row.image_md5 || row.imageMd5 || '').trim() || undefined
+            imageDatName = String(row.image_dat_name || row.imageDatName || '').trim() || undefined
+            emojiCdnUrl = String(row.emoji_cdn_url || row.emojiCdnUrl || '').trim() || undefined
+            emojiMd5 = String(row.emoji_md5 || row.emojiMd5 || '').trim() || undefined
+            videoMd5 = String(row.video_md5 || row.videoMd5 || '').trim() || undefined
+
+            if (localType === 3 && content) {
+              // 图片消息
+              imageMd5 = imageMd5 || this.extractImageMd5(content)
+              imageDatName = imageDatName || this.extractImageDatName(content)
+            } else if (localType === 47 && content) {
+              // 动画表情
+              emojiCdnUrl = emojiCdnUrl || this.extractEmojiUrl(content)
+              emojiMd5 = emojiMd5 || this.extractEmojiMd5(content)
+            } else if (localType === 43 && content) {
+              // 视频消息
+              videoMd5 = videoMd5 || this.extractVideoMd5(content)
+            } else if (collectMode === 'full' && localType === 49 && content) {
+              // 检查是否是聊天记录消息（type=19）
+              const xmlType = this.extractXmlValue(content, 'type')
+              if (xmlType === '19') {
+                chatRecordList = this.parseChatHistory(content)
+              }
             }
           }
 
@@ -2045,6 +2162,10 @@ class ExportService {
       }
     }
 
+    if (collectMode === 'media-fast' && mediaTypeFilter && rows.length > 0) {
+      await this.backfillMediaFieldsFromMessageDetail(sessionId, rows, mediaTypeFilter)
+    }
+
     if (senderSet.size > 0) {
       const usernames = Array.from(senderSet)
       const [nameResult, avatarResult] = await Promise.all([
@@ -2070,6 +2191,60 @@ class ExportService {
     }
 
     return { rows, memberSet, firstTime, lastTime }
+  }
+
+  private async backfillMediaFieldsFromMessageDetail(
+    sessionId: string,
+    rows: any[],
+    targetMediaTypes: Set<number>
+  ): Promise<void> {
+    const needsBackfill = rows.filter((msg) => {
+      if (!targetMediaTypes.has(msg.localType)) return false
+      if (msg.localType === 3) return !msg.imageMd5 && !msg.imageDatName
+      if (msg.localType === 47) return !msg.emojiMd5 && !msg.emojiCdnUrl
+      if (msg.localType === 43) return !msg.videoMd5
+      return false
+    })
+    if (needsBackfill.length === 0) return
+
+    const DETAIL_CONCURRENCY = 6
+    await parallelLimit(needsBackfill, DETAIL_CONCURRENCY, async (msg) => {
+      const localId = Number(msg.localId || 0)
+      if (!Number.isFinite(localId) || localId <= 0) return
+
+      try {
+        const detail = await wcdbService.getMessageById(sessionId, localId)
+        if (!detail.success || !detail.message) return
+
+        const row = detail.message as any
+        const rawMessageContent = row.message_content ?? row.messageContent ?? row.msg_content ?? row.msgContent ?? ''
+        const rawCompressContent = row.compress_content ?? row.compressContent ?? row.msg_compress_content ?? row.msgCompressContent ?? ''
+        const content = this.decodeMessageContent(rawMessageContent, rawCompressContent)
+
+        if (msg.localType === 3) {
+          const imageMd5 = String(row.image_md5 || row.imageMd5 || '').trim() || this.extractImageMd5(content)
+          const imageDatName = String(row.image_dat_name || row.imageDatName || '').trim() || this.extractImageDatName(content)
+          if (imageMd5) msg.imageMd5 = imageMd5
+          if (imageDatName) msg.imageDatName = imageDatName
+          return
+        }
+
+        if (msg.localType === 47) {
+          const emojiMd5 = String(row.emoji_md5 || row.emojiMd5 || '').trim() || this.extractEmojiMd5(content)
+          const emojiCdnUrl = String(row.emoji_cdn_url || row.emojiCdnUrl || '').trim() || this.extractEmojiUrl(content)
+          if (emojiMd5) msg.emojiMd5 = emojiMd5
+          if (emojiCdnUrl) msg.emojiCdnUrl = emojiCdnUrl
+          return
+        }
+
+        if (msg.localType === 43) {
+          const videoMd5 = String(row.video_md5 || row.videoMd5 || '').trim() || this.extractVideoMd5(content)
+          if (videoMd5) msg.videoMd5 = videoMd5
+        }
+      } catch (error) {
+        // 详情补取失败时保持降级导出（占位符），避免中断整批任务。
+      }
+    })
   }
 
   // 补齐群成员，避免只导出发言者导致头像缺失
@@ -2631,7 +2806,15 @@ class ExportService {
         phase: 'preparing'
       })
 
-      const collected = await this.collectMessages(sessionId, cleanedMyWxid, options.dateRange, options.senderUsername)
+      const collectParams = this.resolveCollectParams(options)
+      const collected = await this.collectMessages(
+        sessionId,
+        cleanedMyWxid,
+        options.dateRange,
+        options.senderUsername,
+        collectParams.mode,
+        collectParams.targetMediaTypes
+      )
       const allMessages = collected.rows
 
       // 如果没有消息,不创建文件
@@ -3026,7 +3209,15 @@ class ExportService {
         phase: 'preparing'
       })
 
-      const collected = await this.collectMessages(sessionId, cleanedMyWxid, options.dateRange, options.senderUsername)
+      const collectParams = this.resolveCollectParams(options)
+      const collected = await this.collectMessages(
+        sessionId,
+        cleanedMyWxid,
+        options.dateRange,
+        options.senderUsername,
+        collectParams.mode,
+        collectParams.targetMediaTypes
+      )
 
       // 如果没有消息,不创建文件
       if (collected.rows.length === 0) {
@@ -3600,7 +3791,15 @@ class ExportService {
         phase: 'preparing'
       })
 
-      const collected = await this.collectMessages(sessionId, cleanedMyWxid, options.dateRange, options.senderUsername)
+      const collectParams = this.resolveCollectParams(options)
+      const collected = await this.collectMessages(
+        sessionId,
+        cleanedMyWxid,
+        options.dateRange,
+        options.senderUsername,
+        collectParams.mode,
+        collectParams.targetMediaTypes
+      )
 
       // 如果没有消息,不创建文件
       if (collected.rows.length === 0) {
@@ -4087,7 +4286,15 @@ class ExportService {
         phase: 'preparing'
       })
 
-      const collected = await this.collectMessages(sessionId, cleanedMyWxid, options.dateRange, options.senderUsername)
+      const collectParams = this.resolveCollectParams(options)
+      const collected = await this.collectMessages(
+        sessionId,
+        cleanedMyWxid,
+        options.dateRange,
+        options.senderUsername,
+        collectParams.mode,
+        collectParams.targetMediaTypes
+      )
 
       // 如果没有消息,不创建文件
       if (collected.rows.length === 0) {
@@ -4367,7 +4574,15 @@ class ExportService {
         phase: 'preparing'
       })
 
-      const collected = await this.collectMessages(sessionId, cleanedMyWxid, options.dateRange, options.senderUsername)
+      const collectParams = this.resolveCollectParams(options)
+      const collected = await this.collectMessages(
+        sessionId,
+        cleanedMyWxid,
+        options.dateRange,
+        options.senderUsername,
+        collectParams.mode,
+        collectParams.targetMediaTypes
+      )
       if (collected.rows.length === 0) {
         return { success: false, error: '该会话在指定时间范围内没有消息' }
       }
@@ -4709,7 +4924,15 @@ class ExportService {
         await this.ensureVoiceModel(onProgress)
       }
 
-      const collected = await this.collectMessages(sessionId, cleanedMyWxid, options.dateRange, options.senderUsername)
+      const collectParams = this.resolveCollectParams(options)
+      const collected = await this.collectMessages(
+        sessionId,
+        cleanedMyWxid,
+        options.dateRange,
+        options.senderUsername,
+        collectParams.mode,
+        collectParams.targetMediaTypes
+      )
 
       // 如果没有消息,不创建文件
       if (collected.rows.length === 0) {
@@ -5187,7 +5410,13 @@ class ExportService {
 
     for (const sessionId of sessionIds) {
       const sessionInfo = await this.getContactInfo(sessionId)
-      const collected = await this.collectMessages(sessionId, cleanedMyWxid, options.dateRange, options.senderUsername)
+      const collected = await this.collectMessages(
+        sessionId,
+        cleanedMyWxid,
+        options.dateRange,
+        options.senderUsername,
+        'text-fast'
+      )
       const msgs = collected.rows
       const voiceMsgs = msgs.filter(m => m.localType === 34)
       const mediaMsgs = msgs.filter(m => {
@@ -5264,8 +5493,12 @@ class ExportService {
         return { success: false, successCount: 0, failCount: sessionIds.length, error: conn.error }
       }
 
-      const exportMediaEnabled = options.exportMedia === true &&
-        Boolean(options.exportImages || options.exportVoices || options.exportVideos || options.exportEmojis)
+      const effectiveOptions: ExportOptions = this.isMediaContentBatchExport(options)
+        ? { ...options, exportVoiceAsText: false }
+        : options
+
+      const exportMediaEnabled = effectiveOptions.exportMedia === true &&
+        Boolean(effectiveOptions.exportImages || effectiveOptions.exportVoices || effectiveOptions.exportVideos || effectiveOptions.exportEmojis)
       const rawWriteLayout = this.configService.get('exportWriteLayout')
       const writeLayout = rawWriteLayout === 'A' || rawWriteLayout === 'B' || rawWriteLayout === 'C'
         ? rawWriteLayout
@@ -5277,23 +5510,50 @@ class ExportService {
         fs.mkdirSync(exportBaseDir, { recursive: true })
       }
       const sessionLayout = exportMediaEnabled
-        ? (options.sessionLayout ?? 'per-session')
+        ? (effectiveOptions.sessionLayout ?? 'per-session')
         : 'shared'
       let completedCount = 0
       const defaultConcurrency = exportMediaEnabled ? 2 : 4
-      const rawConcurrency = typeof options.exportConcurrency === 'number'
-        ? Math.floor(options.exportConcurrency)
+      const rawConcurrency = typeof effectiveOptions.exportConcurrency === 'number'
+        ? Math.floor(effectiveOptions.exportConcurrency)
         : defaultConcurrency
       const clampedConcurrency = Math.max(1, Math.min(rawConcurrency, 6))
-      const sessionConcurrency = (exportMediaEnabled && sessionLayout === 'shared')
-        ? 1
-        : clampedConcurrency
+      const sessionConcurrency = clampedConcurrency
+      const emptySessionIds = new Set<string>()
+      const canFastSkipEmptySessions = this.isUnboundedDateRange(effectiveOptions.dateRange) &&
+        !String(effectiveOptions.senderUsername || '').trim()
+      if (canFastSkipEmptySessions && sessionIds.length > 0) {
+        const countsResult = await wcdbService.getMessageCounts(sessionIds)
+        if (countsResult.success && countsResult.counts) {
+          for (const sessionId of sessionIds) {
+            const count = countsResult.counts[sessionId]
+            if (typeof count === 'number' && Number.isFinite(count) && count <= 0) {
+              emptySessionIds.add(sessionId)
+            }
+          }
+        }
+      }
       const queue = [...sessionIds]
       let pauseRequested = false
       let stopRequested = false
 
       const runOne = async (sessionId: string) => {
         const sessionInfo = await this.getContactInfo(sessionId)
+
+        if (emptySessionIds.has(sessionId)) {
+          failCount++
+          failedSessionIds.push(sessionId)
+          completedCount++
+          onProgress?.({
+            current: completedCount,
+            total: sessionIds.length,
+            currentSession: sessionInfo.displayName,
+            currentSessionId: sessionId,
+            phase: 'exporting',
+            phaseLabel: '该会话没有消息，已跳过'
+          })
+          return
+        }
 
         const sessionProgress = (progress: ExportProgress) => {
           onProgress?.({
@@ -5314,7 +5574,7 @@ class ExportService {
 
         const sanitizeName = (value: string) => value.replace(/[<>:"\/\\|?*]/g, '_').replace(/\.+$/, '').trim()
         const baseName = sanitizeName(sessionInfo.displayName || sessionId) || sanitizeName(sessionId) || 'session'
-        const suffix = sanitizeName(options.fileNameSuffix || '')
+        const suffix = sanitizeName(effectiveOptions.fileNameSuffix || '')
         const safeName = suffix ? `${baseName}_${suffix}` : baseName
         const fileNameWithPrefix = `${await this.getSessionFilePrefix(sessionId)}${safeName}`
         const useSessionFolder = sessionLayout === 'per-session'
@@ -5325,28 +5585,28 @@ class ExportService {
         }
 
         let ext = '.json'
-        if (options.format === 'chatlab-jsonl') ext = '.jsonl'
-        else if (options.format === 'excel') ext = '.xlsx'
-        else if (options.format === 'txt') ext = '.txt'
-        else if (options.format === 'weclone') ext = '.csv'
-        else if (options.format === 'html') ext = '.html'
+        if (effectiveOptions.format === 'chatlab-jsonl') ext = '.jsonl'
+        else if (effectiveOptions.format === 'excel') ext = '.xlsx'
+        else if (effectiveOptions.format === 'txt') ext = '.txt'
+        else if (effectiveOptions.format === 'weclone') ext = '.csv'
+        else if (effectiveOptions.format === 'html') ext = '.html'
         const outputPath = path.join(sessionDir, `${fileNameWithPrefix}${ext}`)
 
         let result: { success: boolean; error?: string }
-        if (options.format === 'json' || options.format === 'arkme-json') {
-          result = await this.exportSessionToDetailedJson(sessionId, outputPath, options, sessionProgress)
-        } else if (options.format === 'chatlab' || options.format === 'chatlab-jsonl') {
-          result = await this.exportSessionToChatLab(sessionId, outputPath, options, sessionProgress)
-        } else if (options.format === 'excel') {
-          result = await this.exportSessionToExcel(sessionId, outputPath, options, sessionProgress)
-        } else if (options.format === 'txt') {
-          result = await this.exportSessionToTxt(sessionId, outputPath, options, sessionProgress)
-        } else if (options.format === 'weclone') {
-          result = await this.exportSessionToWeCloneCsv(sessionId, outputPath, options, sessionProgress)
-        } else if (options.format === 'html') {
-          result = await this.exportSessionToHtml(sessionId, outputPath, options, sessionProgress)
+        if (effectiveOptions.format === 'json' || effectiveOptions.format === 'arkme-json') {
+          result = await this.exportSessionToDetailedJson(sessionId, outputPath, effectiveOptions, sessionProgress)
+        } else if (effectiveOptions.format === 'chatlab' || effectiveOptions.format === 'chatlab-jsonl') {
+          result = await this.exportSessionToChatLab(sessionId, outputPath, effectiveOptions, sessionProgress)
+        } else if (effectiveOptions.format === 'excel') {
+          result = await this.exportSessionToExcel(sessionId, outputPath, effectiveOptions, sessionProgress)
+        } else if (effectiveOptions.format === 'txt') {
+          result = await this.exportSessionToTxt(sessionId, outputPath, effectiveOptions, sessionProgress)
+        } else if (effectiveOptions.format === 'weclone') {
+          result = await this.exportSessionToWeCloneCsv(sessionId, outputPath, effectiveOptions, sessionProgress)
+        } else if (effectiveOptions.format === 'html') {
+          result = await this.exportSessionToHtml(sessionId, outputPath, effectiveOptions, sessionProgress)
         } else {
-          result = { success: false, error: `不支持的格式: ${options.format}` }
+          result = { success: false, error: `不支持的格式: ${effectiveOptions.format}` }
         }
 
         if (result.success) {

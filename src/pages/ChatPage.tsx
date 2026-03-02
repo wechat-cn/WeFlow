@@ -152,6 +152,7 @@ const CHAT_SESSION_LIST_CACHE_TTL_MS = 24 * 60 * 60 * 1000
 const CHAT_SESSION_PREVIEW_CACHE_TTL_MS = 24 * 60 * 60 * 1000
 const CHAT_SESSION_PREVIEW_LIMIT_PER_SESSION = 30
 const CHAT_SESSION_PREVIEW_MAX_SESSIONS = 18
+const GROUP_MEMBERS_PANEL_CACHE_TTL_MS = 10 * 60 * 1000
 
 function buildChatSessionListCacheKey(scope: string): string {
   return `weflow.chat.sessions.v1::${scope || 'default'}`
@@ -186,6 +187,17 @@ function formatYmdDateFromSeconds(timestamp?: number): string {
   return `${y}-${m}-${day}`
 }
 
+function formatYmdHmDateTime(timestamp?: number): string {
+  if (!timestamp || !Number.isFinite(timestamp)) return '—'
+  const d = new Date(timestamp)
+  const y = d.getFullYear()
+  const m = `${d.getMonth() + 1}`.padStart(2, '0')
+  const day = `${d.getDate()}`.padStart(2, '0')
+  const h = `${d.getHours()}`.padStart(2, '0')
+  const min = `${d.getMinutes()}`.padStart(2, '0')
+  return `${y}-${m}-${day} ${h}:${min}`
+}
+
 interface ChatPageProps {
   // 保留接口以备将来扩展
 }
@@ -208,9 +220,34 @@ interface SessionDetail {
   groupMyMessages?: number
   groupActiveSpeakers?: number
   groupMutualFriends?: number
+  relationStatsLoaded?: boolean
+  statsUpdatedAt?: number
+  statsStale?: boolean
   firstMessageTime?: number
   latestMessageTime?: number
   messageTables: { dbName: string; tableName: string; count: number }[]
+}
+
+interface SessionExportMetric {
+  totalMessages: number
+  voiceMessages: number
+  imageMessages: number
+  videoMessages: number
+  emojiMessages: number
+  firstTimestamp?: number
+  lastTimestamp?: number
+  privateMutualGroups?: number
+  groupMemberCount?: number
+  groupMyMessages?: number
+  groupActiveSpeakers?: number
+  groupMutualFriends?: number
+}
+
+interface SessionExportCacheMeta {
+  updatedAt: number
+  stale: boolean
+  includeRelations: boolean
+  source: 'memory' | 'disk' | 'fresh'
 }
 
 interface GroupPanelMember {
@@ -239,6 +276,11 @@ interface SessionPreviewCacheEntry {
 interface SessionPreviewCachePayload {
   updatedAt: number
   entries: Record<string, SessionPreviewCacheEntry>
+}
+
+interface GroupMembersPanelCacheEntry {
+  updatedAt: number
+  members: GroupPanelMember[]
 }
 
 // 全局头像加载队列管理器已移至 src/utils/AvatarLoadQueue.ts
@@ -395,9 +437,13 @@ function ChatPage(_props: ChatPageProps) {
   const [sessionDetail, setSessionDetail] = useState<SessionDetail | null>(null)
   const [isLoadingDetail, setIsLoadingDetail] = useState(false)
   const [isLoadingDetailExtra, setIsLoadingDetailExtra] = useState(false)
+  const [isRefreshingDetailStats, setIsRefreshingDetailStats] = useState(false)
+  const [isLoadingRelationStats, setIsLoadingRelationStats] = useState(false)
   const [groupPanelMembers, setGroupPanelMembers] = useState<GroupPanelMember[]>([])
   const [isLoadingGroupMembers, setIsLoadingGroupMembers] = useState(false)
   const [groupMembersError, setGroupMembersError] = useState<string | null>(null)
+  const [groupMembersLoadingHint, setGroupMembersLoadingHint] = useState('')
+  const [isRefreshingGroupMembers, setIsRefreshingGroupMembers] = useState(false)
   const [groupMemberSearchKeyword, setGroupMemberSearchKeyword] = useState('')
   const [copiedField, setCopiedField] = useState<string | null>(null)
   const [highlightedMessageKeys, setHighlightedMessageKeys] = useState<string[]>([])
@@ -478,6 +524,8 @@ function ChatPage(_props: ChatPageProps) {
   const lastPreloadSessionRef = useRef<string | null>(null)
   const detailRequestSeqRef = useRef(0)
   const groupMembersRequestSeqRef = useRef(0)
+  const groupMembersPanelCacheRef = useRef<Map<string, GroupMembersPanelCacheEntry>>(new Map())
+  const hasInitializedGroupMembersRef = useRef(false)
   const chatCacheScopeRef = useRef('default')
   const previewCacheRef = useRef<Record<string, SessionPreviewCacheEntry>>({})
   const previewPersistTimerRef = useRef<number | null>(null)
@@ -722,6 +770,40 @@ function ChatPage(_props: ChatPageProps) {
     }
   }, [])
 
+  const applySessionDetailStats = useCallback((
+    sessionId: string,
+    metric: SessionExportMetric,
+    cacheMeta?: SessionExportCacheMeta,
+    relationLoadedOverride?: boolean
+  ) => {
+    setSessionDetail((prev) => {
+      if (!prev || prev.wxid !== sessionId) return prev
+      const relationLoaded = relationLoadedOverride ?? Boolean(prev.relationStatsLoaded)
+      return {
+        ...prev,
+        messageCount: Number.isFinite(metric.totalMessages) ? metric.totalMessages : prev.messageCount,
+        voiceMessages: Number.isFinite(metric.voiceMessages) ? metric.voiceMessages : prev.voiceMessages,
+        imageMessages: Number.isFinite(metric.imageMessages) ? metric.imageMessages : prev.imageMessages,
+        videoMessages: Number.isFinite(metric.videoMessages) ? metric.videoMessages : prev.videoMessages,
+        emojiMessages: Number.isFinite(metric.emojiMessages) ? metric.emojiMessages : prev.emojiMessages,
+        groupMemberCount: Number.isFinite(metric.groupMemberCount) ? metric.groupMemberCount : prev.groupMemberCount,
+        groupMyMessages: Number.isFinite(metric.groupMyMessages) ? metric.groupMyMessages : prev.groupMyMessages,
+        groupActiveSpeakers: Number.isFinite(metric.groupActiveSpeakers) ? metric.groupActiveSpeakers : prev.groupActiveSpeakers,
+        privateMutualGroups: relationLoaded && Number.isFinite(metric.privateMutualGroups)
+          ? metric.privateMutualGroups
+          : prev.privateMutualGroups,
+        groupMutualFriends: relationLoaded && Number.isFinite(metric.groupMutualFriends)
+          ? metric.groupMutualFriends
+          : prev.groupMutualFriends,
+        relationStatsLoaded: relationLoaded,
+        statsUpdatedAt: cacheMeta?.updatedAt ?? prev.statsUpdatedAt,
+        statsStale: typeof cacheMeta?.stale === 'boolean' ? cacheMeta.stale : prev.statsStale,
+        firstMessageTime: Number.isFinite(metric.firstTimestamp) ? metric.firstTimestamp : prev.firstMessageTime,
+        latestMessageTime: Number.isFinite(metric.lastTimestamp) ? metric.lastTimestamp : prev.latestMessageTime
+      }
+    })
+  }, [])
+
   // 加载会话详情
   const loadSessionDetail = useCallback(async (sessionId: string) => {
     const normalizedSessionId = String(sessionId || '').trim()
@@ -733,6 +815,8 @@ function ChatPage(_props: ChatPageProps) {
       ? Math.floor(mappedSession.messageCountHint)
       : undefined
 
+    setIsRefreshingDetailStats(false)
+    setIsLoadingRelationStats(false)
     setSessionDetail((prev) => {
       const sameSession = prev?.wxid === normalizedSessionId
       return {
@@ -752,6 +836,9 @@ function ChatPage(_props: ChatPageProps) {
         groupMyMessages: sameSession ? prev?.groupMyMessages : undefined,
         groupActiveSpeakers: sameSession ? prev?.groupActiveSpeakers : undefined,
         groupMutualFriends: sameSession ? prev?.groupMutualFriends : undefined,
+        relationStatsLoaded: sameSession ? prev?.relationStatsLoaded : false,
+        statsUpdatedAt: sameSession ? prev?.statsUpdatedAt : undefined,
+        statsStale: sameSession ? prev?.statsStale : undefined,
         firstMessageTime: sameSession ? prev?.firstMessageTime : undefined,
         latestMessageTime: sameSession ? prev?.latestMessageTime : undefined,
         messageTables: sameSession && Array.isArray(prev?.messageTables) ? prev.messageTables : []
@@ -781,6 +868,9 @@ function ChatPage(_props: ChatPageProps) {
           groupMyMessages: prev?.groupMyMessages,
           groupActiveSpeakers: prev?.groupActiveSpeakers,
           groupMutualFriends: prev?.groupMutualFriends,
+          relationStatsLoaded: prev?.relationStatsLoaded,
+          statsUpdatedAt: prev?.statsUpdatedAt,
+          statsStale: prev?.statsStale,
           firstMessageTime: prev?.firstMessageTime,
           latestMessageTime: prev?.latestMessageTime,
           messageTables: Array.isArray(prev?.messageTables) ? (prev?.messageTables || []) : []
@@ -797,47 +887,82 @@ function ChatPage(_props: ChatPageProps) {
     try {
       const [extraResultSettled, statsResultSettled] = await Promise.allSettled([
         window.electronAPI.chat.getSessionDetailExtra(normalizedSessionId),
-        window.electronAPI.chat.getExportSessionStats([normalizedSessionId])
+        window.electronAPI.chat.getExportSessionStats(
+          [normalizedSessionId],
+          { includeRelations: false, allowStaleCache: true }
+        )
       ])
 
       if (requestSeq !== detailRequestSeqRef.current) return
 
-      setSessionDetail((prev) => {
-        if (!prev || prev.wxid !== normalizedSessionId) return prev
-
-        let next = { ...prev }
-        if (extraResultSettled.status === 'fulfilled' && extraResultSettled.value.success && extraResultSettled.value.detail) {
-          next = {
-            ...next,
-            firstMessageTime: extraResultSettled.value.detail.firstMessageTime,
-            latestMessageTime: extraResultSettled.value.detail.latestMessageTime,
-            messageTables: Array.isArray(extraResultSettled.value.detail.messageTables) ? extraResultSettled.value.detail.messageTables : []
-          }
+      if (extraResultSettled.status === 'fulfilled' && extraResultSettled.value.success) {
+        const detail = extraResultSettled.value.detail
+        if (detail) {
+          setSessionDetail((prev) => {
+            if (!prev || prev.wxid !== normalizedSessionId) return prev
+            return {
+              ...prev,
+              firstMessageTime: detail.firstMessageTime,
+              latestMessageTime: detail.latestMessageTime,
+              messageTables: Array.isArray(detail.messageTables) ? detail.messageTables : []
+            }
+          })
         }
+      }
 
-        if (statsResultSettled.status === 'fulfilled' && statsResultSettled.value.success && statsResultSettled.value.data) {
-          const metric = statsResultSettled.value.data[normalizedSessionId]
-          if (metric) {
-            next = {
-              ...next,
-              messageCount: Number.isFinite(metric.totalMessages) ? metric.totalMessages : next.messageCount,
-              voiceMessages: metric.voiceMessages,
-              imageMessages: metric.imageMessages,
-              videoMessages: metric.videoMessages,
-              emojiMessages: metric.emojiMessages,
-              privateMutualGroups: metric.privateMutualGroups,
-              groupMemberCount: metric.groupMemberCount,
-              groupMyMessages: metric.groupMyMessages,
-              groupActiveSpeakers: metric.groupActiveSpeakers,
-              groupMutualFriends: metric.groupMutualFriends,
-              firstMessageTime: Number.isFinite(metric.firstTimestamp) ? metric.firstTimestamp : next.firstMessageTime,
-              latestMessageTime: Number.isFinite(metric.lastTimestamp) ? metric.lastTimestamp : next.latestMessageTime
+      let refreshIncludeRelations = false
+      let shouldRefreshStats = false
+      if (statsResultSettled.status === 'fulfilled' && statsResultSettled.value.success) {
+        const metric = statsResultSettled.value.data?.[normalizedSessionId] as SessionExportMetric | undefined
+        const cacheMeta = statsResultSettled.value.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
+        refreshIncludeRelations = Boolean(cacheMeta?.includeRelations)
+        if (metric) {
+          applySessionDetailStats(normalizedSessionId, metric, cacheMeta, refreshIncludeRelations)
+        } else if (cacheMeta) {
+          setSessionDetail((prev) => {
+            if (!prev || prev.wxid !== normalizedSessionId) return prev
+            return {
+              ...prev,
+              relationStatsLoaded: refreshIncludeRelations || prev.relationStatsLoaded,
+              statsUpdatedAt: cacheMeta.updatedAt,
+              statsStale: cacheMeta.stale
+            }
+          })
+        }
+        shouldRefreshStats = Array.isArray(statsResultSettled.value.needsRefresh) &&
+          statsResultSettled.value.needsRefresh.includes(normalizedSessionId)
+      }
+
+      if (shouldRefreshStats) {
+        setIsRefreshingDetailStats(true)
+        void (async () => {
+          try {
+            const freshResult = await window.electronAPI.chat.getExportSessionStats(
+              [normalizedSessionId],
+              { includeRelations: refreshIncludeRelations, forceRefresh: true }
+            )
+            if (requestSeq !== detailRequestSeqRef.current) return
+            if (freshResult.success && freshResult.data) {
+              const metric = freshResult.data[normalizedSessionId] as SessionExportMetric | undefined
+              const cacheMeta = freshResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
+              if (metric) {
+                applySessionDetailStats(
+                  normalizedSessionId,
+                  metric,
+                  cacheMeta,
+                  refreshIncludeRelations ? true : undefined
+                )
+              }
+            }
+          } catch (error) {
+            console.error('刷新会话统计失败:', error)
+          } finally {
+            if (requestSeq === detailRequestSeqRef.current) {
+              setIsRefreshingDetailStats(false)
             }
           }
-        }
-
-        return next
-      })
+        })()
+      }
     } catch (e) {
       console.error('加载会话详情补充统计失败:', e)
     } finally {
@@ -845,51 +970,120 @@ function ChatPage(_props: ChatPageProps) {
         setIsLoadingDetailExtra(false)
       }
     }
-  }, [])
+  }, [applySessionDetailStats])
+
+  const loadRelationStats = useCallback(async () => {
+    const normalizedSessionId = String(currentSessionId || '').trim()
+    if (!normalizedSessionId || isLoadingRelationStats) return
+
+    const requestSeq = detailRequestSeqRef.current
+    setIsLoadingRelationStats(true)
+    try {
+      const relationResult = await window.electronAPI.chat.getExportSessionStats(
+        [normalizedSessionId],
+        { includeRelations: true, allowStaleCache: true }
+      )
+      if (requestSeq !== detailRequestSeqRef.current) return
+
+      const metric = relationResult.success && relationResult.data
+        ? relationResult.data[normalizedSessionId] as SessionExportMetric | undefined
+        : undefined
+      const cacheMeta = relationResult.success
+        ? relationResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
+        : undefined
+      if (metric) {
+        applySessionDetailStats(normalizedSessionId, metric, cacheMeta, true)
+      }
+
+      const needRefresh = relationResult.success &&
+        Array.isArray(relationResult.needsRefresh) &&
+        relationResult.needsRefresh.includes(normalizedSessionId)
+
+      if (needRefresh) {
+        setIsRefreshingDetailStats(true)
+        void (async () => {
+          try {
+            const freshResult = await window.electronAPI.chat.getExportSessionStats(
+              [normalizedSessionId],
+              { includeRelations: true, forceRefresh: true }
+            )
+            if (requestSeq !== detailRequestSeqRef.current) return
+            if (freshResult.success && freshResult.data) {
+              const freshMetric = freshResult.data[normalizedSessionId] as SessionExportMetric | undefined
+              const freshMeta = freshResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
+              if (freshMetric) {
+                applySessionDetailStats(normalizedSessionId, freshMetric, freshMeta, true)
+              }
+            }
+          } catch (error) {
+            console.error('刷新会话关系统计失败:', error)
+          } finally {
+            if (requestSeq === detailRequestSeqRef.current) {
+              setIsRefreshingDetailStats(false)
+            }
+          }
+        })()
+      }
+    } catch (error) {
+      console.error('加载会话关系统计失败:', error)
+    } finally {
+      if (requestSeq === detailRequestSeqRef.current) {
+        setIsLoadingRelationStats(false)
+      }
+    }
+  }, [applySessionDetailStats, currentSessionId, isLoadingRelationStats])
 
   const loadGroupMembersPanel = useCallback(async (chatroomId: string) => {
     if (!chatroomId || !isGroupChatSession(chatroomId)) return
 
     const requestSeq = ++groupMembersRequestSeqRef.current
-    setIsLoadingGroupMembers(true)
+    const now = Date.now()
+    const cached = groupMembersPanelCacheRef.current.get(chatroomId)
+    const cacheFresh = Boolean(cached && now - cached.updatedAt < GROUP_MEMBERS_PANEL_CACHE_TTL_MS)
+    const hasCachedMembers = Boolean(cached && cached.members.length > 0)
+
+    if (cacheFresh && cached) {
+      setGroupPanelMembers(cached.members)
+      setGroupMembersError(null)
+      setGroupMembersLoadingHint('')
+      setIsRefreshingGroupMembers(false)
+      setIsLoadingGroupMembers(false)
+      hasInitializedGroupMembersRef.current = true
+      return
+    }
+
     setGroupMembersError(null)
+    if (hasCachedMembers && cached) {
+      setGroupPanelMembers(cached.members)
+      setIsRefreshingGroupMembers(true)
+      setGroupMembersLoadingHint('')
+      setIsLoadingGroupMembers(false)
+    } else {
+      setGroupPanelMembers([])
+      setIsRefreshingGroupMembers(false)
+      setIsLoadingGroupMembers(true)
+      setGroupMembersLoadingHint(
+        hasInitializedGroupMembersRef.current
+          ? '加载群成员中...'
+          : '首次加载群成员，正在初始化索引（可能需要几秒）'
+      )
+    }
 
     try {
-      const [membersResult, rankingResult, contactsResult] = await Promise.all([
-        window.electronAPI.groupAnalytics.getGroupMembers(chatroomId),
-        window.electronAPI.groupAnalytics.getGroupMessageRanking(chatroomId, 20000),
-        window.electronAPI.chat.getContacts()
-      ])
+      const membersResult = await window.electronAPI.groupAnalytics.getGroupMembersPanelData(chatroomId)
       if (requestSeq !== groupMembersRequestSeqRef.current) return
 
       if (!membersResult.success || !Array.isArray(membersResult.data)) {
-        setGroupPanelMembers([])
-        setGroupMembersError(membersResult.error || '加载群成员失败')
+        if (!hasCachedMembers) {
+          setGroupPanelMembers([])
+        }
+        setGroupMembersError(membersResult.error || (hasCachedMembers ? '刷新群成员失败，已显示缓存数据' : '加载群成员失败'))
         return
       }
 
-      const messageCountMap = new Map<string, number>()
-      if (rankingResult.success && Array.isArray(rankingResult.data)) {
-        for (const rank of rankingResult.data) {
-          const username = String(rank.member?.username || '').trim()
-          if (!username) continue
-          const count = Number.isFinite(rank.messageCount) ? Math.max(0, Math.floor(rank.messageCount)) : 0
-          messageCountMap.set(username, count)
-        }
-      }
-
-      const friendSet = new Set<string>()
-      if (contactsResult.success && Array.isArray(contactsResult.contacts)) {
-        for (const contact of contactsResult.contacts) {
-          if (contact.type !== 'friend') continue
-          const username = String(contact.username || '').trim()
-          if (!username) continue
-          friendSet.add(username)
-        }
-      }
-
-      const members: GroupPanelMember[] = membersResult.data
-        .map((member) => {
+      const membersPayload = membersResult.data as GroupPanelMember[]
+      const members: GroupPanelMember[] = membersPayload
+        .map((member: GroupPanelMember): GroupPanelMember | null => {
           const username = String(member.username || '').trim()
           if (!username) return null
           const preferredName = String(
@@ -909,12 +1103,12 @@ function ChatPage(_props: ChatPageProps) {
             remark: member.remark,
             groupNickname: member.groupNickname,
             isOwner: Boolean(member.isOwner),
-            isFriend: friendSet.has(username),
-            messageCount: messageCountMap.get(username) || 0
+            isFriend: Boolean(member.isFriend),
+            messageCount: Number.isFinite(member.messageCount) ? Math.max(0, Math.floor(member.messageCount)) : 0
           }
         })
-        .filter((member): member is GroupPanelMember => Boolean(member))
-        .sort((a, b) => {
+        .filter((member: GroupPanelMember | null): member is GroupPanelMember => Boolean(member))
+        .sort((a: GroupPanelMember, b: GroupPanelMember) => {
           const ownerDiff = Number(Boolean(b.isOwner)) - Number(Boolean(a.isOwner))
           if (ownerDiff !== 0) return ownerDiff
 
@@ -926,19 +1120,33 @@ function ChatPage(_props: ChatPageProps) {
         })
 
       setGroupPanelMembers(members)
-      if (!rankingResult.success) {
-        setGroupMembersError(rankingResult.error || '群成员发言统计加载失败')
+      setGroupMembersError(null)
+      groupMembersPanelCacheRef.current.set(chatroomId, {
+        updatedAt: Date.now(),
+        members
+      })
+      if (groupMembersPanelCacheRef.current.size > 80) {
+        const oldestEntry = Array.from(groupMembersPanelCacheRef.current.entries())
+          .sort((a, b) => a[1].updatedAt - b[1].updatedAt)[0]
+        if (oldestEntry) {
+          groupMembersPanelCacheRef.current.delete(oldestEntry[0])
+        }
       }
+      hasInitializedGroupMembersRef.current = true
     } catch (e) {
       if (requestSeq !== groupMembersRequestSeqRef.current) return
-      setGroupPanelMembers([])
-      setGroupMembersError(String(e))
+      if (!hasCachedMembers) {
+        setGroupPanelMembers([])
+      }
+      setGroupMembersError(hasCachedMembers ? '刷新群成员失败，已显示缓存数据' : String(e))
     } finally {
       if (requestSeq === groupMembersRequestSeqRef.current) {
         setIsLoadingGroupMembers(false)
+        setIsRefreshingGroupMembers(false)
+        setGroupMembersLoadingHint('')
       }
     }
-  }, [])
+  }, [isGroupChatSession])
 
   const toggleGroupMembersPanel = useCallback(() => {
     if (!currentSessionId || !isGroupChatSession(currentSessionId)) return
@@ -1024,12 +1232,18 @@ function ChatPage(_props: ChatPageProps) {
     pendingSessionLoadRef.current = null
     setIsSessionSwitching(false)
     setSessionDetail(null)
+    setIsRefreshingDetailStats(false)
+    setIsLoadingRelationStats(false)
     setShowDetailPanel(false)
     setShowGroupMembersPanel(false)
     setGroupPanelMembers([])
     setGroupMembersError(null)
+    setGroupMembersLoadingHint('')
+    setIsRefreshingGroupMembers(false)
     setGroupMemberSearchKeyword('')
     groupMembersRequestSeqRef.current += 1
+    groupMembersPanelCacheRef.current.clear()
+    hasInitializedGroupMembersRef.current = false
     setIsLoadingGroupMembers(false)
     setCurrentSession(null)
     setSessions([])
@@ -1694,9 +1908,13 @@ function ChatPage(_props: ChatPageProps) {
     setShowGroupMembersPanel(false)
     setGroupMemberSearchKeyword('')
     setGroupMembersError(null)
+    setGroupMembersLoadingHint('')
+    setIsRefreshingGroupMembers(false)
     groupMembersRequestSeqRef.current += 1
     setIsLoadingGroupMembers(false)
     setSessionDetail(null)
+    setIsRefreshingDetailStats(false)
+    setIsLoadingRelationStats(false)
   }
 
   // 搜索过滤
@@ -3146,10 +3364,22 @@ function ChatPage(_props: ChatPageProps) {
                     </div>
                   </div>
 
+                  {isRefreshingGroupMembers && (
+                    <div className="group-members-status" role="status" aria-live="polite">
+                      <Loader2 size={14} className="spin" />
+                      <span>正在更新群成员数据...</span>
+                    </div>
+                  )}
+                  {groupMembersError && groupPanelMembers.length > 0 && (
+                    <div className="group-members-status warning" role="status" aria-live="polite">
+                      <span>{groupMembersError}</span>
+                    </div>
+                  )}
+
                   {isLoadingGroupMembers ? (
                     <div className="detail-loading">
                       <Loader2 size={20} className="spin" />
-                      <span>加载群成员中...</span>
+                      <span>{groupMembersLoadingHint || '加载群成员中...'}</span>
                     </div>
                   ) : groupMembersError && groupPanelMembers.length === 0 ? (
                     <div className="detail-empty">{groupMembersError}</div>
@@ -3256,6 +3486,13 @@ function ChatPage(_props: ChatPageProps) {
                           <MessageSquare size={14} />
                           <span>消息统计（导出口径）</span>
                         </div>
+                        <div className="detail-stats-meta">
+                          {isRefreshingDetailStats
+                            ? '统计刷新中...'
+                            : sessionDetail.statsUpdatedAt
+                              ? `${sessionDetail.statsStale ? '缓存于' : '更新于'} ${formatYmdHmDateTime(sessionDetail.statsUpdatedAt)}${sessionDetail.statsStale ? '（将后台刷新）' : ''}`
+                              : (isLoadingDetailExtra ? '统计加载中...' : '暂无统计缓存')}
+                        </div>
                         <div className="detail-item">
                           <span className="label">消息总数</span>
                           <span className="value highlight">
@@ -3325,9 +3562,19 @@ function ChatPage(_props: ChatPageProps) {
                             <div className="detail-item">
                               <span className="label">群共同好友数</span>
                               <span className="value">
-                                {Number.isFinite(sessionDetail.groupMutualFriends)
-                                  ? (sessionDetail.groupMutualFriends as number).toLocaleString()
-                                  : (isLoadingDetailExtra ? '统计中...' : '—')}
+                                {sessionDetail.relationStatsLoaded
+                                  ? (Number.isFinite(sessionDetail.groupMutualFriends)
+                                    ? (sessionDetail.groupMutualFriends as number).toLocaleString()
+                                    : '—')
+                                  : (
+                                    <button
+                                      className="detail-inline-btn"
+                                      onClick={() => { void loadRelationStats() }}
+                                      disabled={isLoadingRelationStats || isLoadingDetailExtra}
+                                    >
+                                      {isLoadingRelationStats ? '加载中...' : '点击加载'}
+                                    </button>
+                                  )}
                               </span>
                             </div>
                           </>
@@ -3335,9 +3582,19 @@ function ChatPage(_props: ChatPageProps) {
                           <div className="detail-item">
                             <span className="label">共同群聊数</span>
                             <span className="value">
-                              {Number.isFinite(sessionDetail.privateMutualGroups)
-                                ? (sessionDetail.privateMutualGroups as number).toLocaleString()
-                                : (isLoadingDetailExtra ? '统计中...' : '—')}
+                              {sessionDetail.relationStatsLoaded
+                                ? (Number.isFinite(sessionDetail.privateMutualGroups)
+                                  ? (sessionDetail.privateMutualGroups as number).toLocaleString()
+                                  : '—')
+                                : (
+                                  <button
+                                    className="detail-inline-btn"
+                                    onClick={() => { void loadRelationStats() }}
+                                    disabled={isLoadingRelationStats || isLoadingDetailExtra}
+                                  >
+                                    {isLoadingRelationStats ? '加载中...' : '点击加载'}
+                                  </button>
+                                )}
                             </span>
                           </div>
                         )}
