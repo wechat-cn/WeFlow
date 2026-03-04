@@ -2610,7 +2610,7 @@ function ExportPage() {
         ...item,
         label: contentTypeLabels[item.type],
         stats: [
-          { label: '已导出', value: exported }
+          { label: '已导出', value: exported, unit: '个对话' }
         ]
       }
     })
@@ -2619,9 +2619,9 @@ function ExportPage() {
       type: 'sns' as ContentCardType,
       icon: Aperture,
       label: '朋友圈',
+      headerCount: snsStats.totalPosts,
       stats: [
-        { label: '朋友圈条数', value: snsStats.totalPosts },
-        { label: '已导出', value: snsExportedCount }
+        { label: '已导出', value: snsExportedCount, unit: '条' }
       ]
     }
 
@@ -3661,6 +3661,15 @@ function ExportPage() {
             <div key={card.type} className="content-card">
               <div className="card-header">
                 <div className="card-title"><Icon size={16} /> {card.label}</div>
+                {card.type === 'sns' && (
+                  <div className="card-title-meta">
+                    {isCardStatsLoading ? (
+                      <span className="count-loading">
+                        统计中<span className="animated-ellipsis" aria-hidden="true">...</span>
+                      </span>
+                    ) : `${card.headerCount.toLocaleString()} 条`}
+                  </div>
+                )}
               </div>
               <div className="card-stats">
                 {card.stats.map((stat) => (
@@ -3671,7 +3680,7 @@ function ExportPage() {
                         <span className="count-loading">
                           统计中<span className="animated-ellipsis" aria-hidden="true">...</span>
                         </span>
-                      ) : stat.value.toLocaleString()}
+                      ) : `${stat.value.toLocaleString()} ${stat.unit}`}
                     </strong>
                   </div>
                 ))}
@@ -3951,87 +3960,93 @@ function ExportPage() {
                 <span>暂无联系人</span>
               </div>
             ) : (
-              <div className="contacts-list" ref={contactsListRef} onScroll={onContactsListScroll}>
-                <div
-                  className="contacts-list-virtual"
-                  style={{ height: filteredContacts.length * CONTACTS_LIST_VIRTUAL_ROW_HEIGHT }}
-                >
-                  {visibleContacts.map((contact, idx) => {
-                    const absoluteIndex = contactStartIndex + idx
-                    const top = absoluteIndex * CONTACTS_LIST_VIRTUAL_ROW_HEIGHT
-                    const matchedSession = sessionRowByUsername.get(contact.username)
-                    const canExport = Boolean(matchedSession?.hasSession)
-                    const isRunning = canExport && runningSessionIds.has(contact.username)
-                    const isQueued = canExport && queuedSessionIds.has(contact.username)
-                    const isPaused = canExport && pausedSessionIds.has(contact.username)
-                    const recent = canExport ? formatRecentExportTime(lastExportBySession[contact.username], nowTick) : ''
-                    const countedMessages = normalizeMessageCount(sessionMessageCounts[contact.username])
-                    const hintedMessages = normalizeMessageCount(matchedSession?.messageCountHint)
-                    const displayedMessageCount = countedMessages ?? hintedMessages
-                    const messageCountLabel = !canExport
-                      ? '--'
-                      : typeof displayedMessageCount === 'number'
-                        ? displayedMessageCount.toLocaleString('zh-CN')
-                        : (isLoadingSessionCounts ? '统计中…' : '--')
-                    return (
-                      <div
-                        key={contact.username}
-                        className="contact-row"
-                        style={{ transform: `translateY(${top}px)` }}
-                      >
-                        <div className="contact-item">
-                          <div className="contact-avatar">
-                            {contact.avatarUrl ? (
-                              <img src={contact.avatarUrl} alt="" loading="lazy" />
-                            ) : (
-                              <span>{getAvatarLetter(contact.displayName)}</span>
-                            )}
-                          </div>
-                          <div className="contact-info">
-                            <div className="contact-name">{contact.displayName}</div>
-                            <div className="contact-remark">{contact.username}</div>
-                          </div>
-                          <div className="row-message-count">
-                            <span className="row-message-count-label">总消息</span>
-                            <strong className={`row-message-count-value ${typeof displayedMessageCount === 'number' ? '' : 'muted'}`}>
-                              {messageCountLabel}
-                            </strong>
-                          </div>
-                          <div className="row-action-cell">
-                            <div className="row-action-main">
-                              <button
-                                className={`row-detail-btn ${showSessionDetailPanel && sessionDetail?.wxid === contact.username ? 'active' : ''}`}
-                                onClick={() => openSessionDetail(contact.username)}
-                              >
-                                详情
-                              </button>
-                              <button
-                                className={`row-export-btn ${isRunning ? 'running' : ''} ${isPaused ? 'paused' : ''} ${!canExport ? 'no-session' : ''}`}
-                                disabled={!canExport || isRunning || isPaused}
-                                onClick={() => {
-                                  if (!matchedSession || !matchedSession.hasSession) return
-                                  openSingleExport({
-                                    ...matchedSession,
-                                    displayName: contact.displayName || matchedSession.displayName || matchedSession.username
-                                  })
-                                }}
-                              >
-                                {isRunning ? (
-                                  <>
-                                    <Loader2 size={14} className="spin" />
-                                    导出中
-                                  </>
-                                ) : !canExport ? '暂无会话' : isPaused ? '已暂停' : isQueued ? '排队中' : '导出'}
-                              </button>
+              <>
+                <div className="contacts-list-header">
+                  <span className="contacts-list-header-main">联系人（头像/名称/微信号）</span>
+                  <span className="contacts-list-header-count">总消息</span>
+                  <span className="contacts-list-header-actions">操作</span>
+                </div>
+                <div className="contacts-list" ref={contactsListRef} onScroll={onContactsListScroll}>
+                  <div
+                    className="contacts-list-virtual"
+                    style={{ height: filteredContacts.length * CONTACTS_LIST_VIRTUAL_ROW_HEIGHT }}
+                  >
+                    {visibleContacts.map((contact, idx) => {
+                      const absoluteIndex = contactStartIndex + idx
+                      const top = absoluteIndex * CONTACTS_LIST_VIRTUAL_ROW_HEIGHT
+                      const matchedSession = sessionRowByUsername.get(contact.username)
+                      const canExport = Boolean(matchedSession?.hasSession)
+                      const isRunning = canExport && runningSessionIds.has(contact.username)
+                      const isQueued = canExport && queuedSessionIds.has(contact.username)
+                      const isPaused = canExport && pausedSessionIds.has(contact.username)
+                      const recent = canExport ? formatRecentExportTime(lastExportBySession[contact.username], nowTick) : ''
+                      const countedMessages = normalizeMessageCount(sessionMessageCounts[contact.username])
+                      const hintedMessages = normalizeMessageCount(matchedSession?.messageCountHint)
+                      const displayedMessageCount = countedMessages ?? hintedMessages
+                      const messageCountLabel = !canExport
+                        ? '--'
+                        : typeof displayedMessageCount === 'number'
+                          ? displayedMessageCount.toLocaleString('zh-CN')
+                          : (isLoadingSessionCounts ? '统计中…' : '--')
+                      return (
+                        <div
+                          key={contact.username}
+                          className="contact-row"
+                          style={{ transform: `translateY(${top}px)` }}
+                        >
+                          <div className="contact-item">
+                            <div className="contact-avatar">
+                              {contact.avatarUrl ? (
+                                <img src={contact.avatarUrl} alt="" loading="lazy" />
+                              ) : (
+                                <span>{getAvatarLetter(contact.displayName)}</span>
+                              )}
                             </div>
-                            {recent && <span className="row-export-time">{recent}</span>}
+                            <div className="contact-info">
+                              <div className="contact-name">{contact.displayName}</div>
+                              <div className="contact-remark">{contact.username}</div>
+                            </div>
+                            <div className="row-message-count">
+                              <strong className={`row-message-count-value ${typeof displayedMessageCount === 'number' ? '' : 'muted'}`}>
+                                {messageCountLabel}
+                              </strong>
+                            </div>
+                            <div className="row-action-cell">
+                              <div className="row-action-main">
+                                <button
+                                  className={`row-detail-btn ${showSessionDetailPanel && sessionDetail?.wxid === contact.username ? 'active' : ''}`}
+                                  onClick={() => openSessionDetail(contact.username)}
+                                >
+                                  详情
+                                </button>
+                                <button
+                                  className={`row-export-btn ${isRunning ? 'running' : ''} ${isPaused ? 'paused' : ''} ${!canExport ? 'no-session' : ''}`}
+                                  disabled={!canExport || isRunning || isPaused}
+                                  onClick={() => {
+                                    if (!matchedSession || !matchedSession.hasSession) return
+                                    openSingleExport({
+                                      ...matchedSession,
+                                      displayName: contact.displayName || matchedSession.displayName || matchedSession.username
+                                    })
+                                  }}
+                                >
+                                  {isRunning ? (
+                                    <>
+                                      <Loader2 size={14} className="spin" />
+                                      导出中
+                                    </>
+                                  ) : !canExport ? '暂无会话' : isPaused ? '已暂停' : isQueued ? '排队中' : '导出'}
+                                </button>
+                              </div>
+                              {recent && <span className="row-export-time">{recent}</span>}
+                            </div>
                           </div>
                         </div>
-                      </div>
-                    )
-                  })}
+                      )
+                    })}
+                  </div>
                 </div>
-              </div>
+              </>
             )}
           </div>
 

@@ -320,6 +320,13 @@
     font-weight: 600;
   }
 
+  .card-title-meta {
+    color: var(--text-secondary);
+    font-size: 12px;
+    white-space: nowrap;
+    font-weight: 500;
+  }
+
   .card-refresh-hint {
     color: var(--text-tertiary);
     font-size: 11px;
@@ -1108,6 +1115,8 @@
 }
 
 .table-wrap {
+  --contacts-message-col-width: 92px;
+  --contacts-action-col-width: 172px;
   overflow: hidden;
   border: 1px solid var(--border-color);
   border-radius: 10px;
@@ -1227,6 +1236,37 @@
     word-break: break-word;
   }
 
+  .contacts-list-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px 8px;
+    border-bottom: 1px solid color-mix(in srgb, var(--border-color) 85%, transparent);
+    background: color-mix(in srgb, var(--bg-primary) 78%, var(--bg-secondary));
+    font-size: 12px;
+    color: var(--text-tertiary);
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    flex-shrink: 0;
+  }
+
+  .contacts-list-header-main {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .contacts-list-header-count {
+    width: var(--contacts-message-col-width);
+    text-align: right;
+    flex-shrink: 0;
+  }
+
+  .contacts-list-header-actions {
+    width: var(--contacts-action-col-width);
+    text-align: right;
+    flex-shrink: 0;
+  }
+
   .contacts-list {
     flex: 1;
     min-height: 0;
@@ -1335,19 +1375,13 @@
   }
 
   .row-message-count {
-    min-width: 82px;
+    width: var(--contacts-message-col-width);
+    min-width: var(--contacts-message-col-width);
     display: flex;
-    flex-direction: column;
     align-items: flex-end;
-    gap: 2px;
+    justify-content: center;
     flex-shrink: 0;
     text-align: right;
-  }
-
-  .row-message-count-label {
-    font-size: 11px;
-    color: var(--text-tertiary);
-    line-height: 1;
   }
 
   .row-message-count-value {
@@ -1504,6 +1538,8 @@
   flex-direction: column;
   align-items: flex-end;
   gap: 4px;
+  width: var(--contacts-action-col-width);
+  flex-shrink: 0;
 
   .row-action-main {
     display: inline-flex;
@@ -2280,12 +2316,22 @@
 }
 
 @media (max-width: 720px) {
-  .table-wrap .row-message-count {
-    min-width: 66px;
+  .table-wrap {
+    --contacts-message-col-width: 66px;
+    --contacts-action-col-width: 148px;
   }
 
-  .table-wrap .row-message-count-label {
-    display: none;
+  .table-wrap .contacts-list-header {
+    gap: 8px;
+    padding: 8px 10px 6px;
+  }
+
+  .table-wrap .contacts-list {
+    padding: 0 10px 10px;
+  }
+
+  .table-wrap .row-message-count {
+    min-width: var(--contacts-message-col-width);
   }
 
   .diag-panel-header {
