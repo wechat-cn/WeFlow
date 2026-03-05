@@ -598,6 +598,10 @@ const isContentScopeSession = (session: SessionRow): boolean => (
   session.kind === 'private' || session.kind === 'group' || session.kind === 'former_friend'
 )
 
+const isExportConversationSession = (session: SessionRow): boolean => (
+  session.kind === 'private' || session.kind === 'group' || session.kind === 'former_friend'
+)
+
 const exportKindPriority: Record<ConversationTab, number> = {
   private: 0,
   group: 1,
@@ -2722,7 +2726,7 @@ function ExportPage() {
       const cachedContactMap = toContactMapFromCaches(cachedContacts, cachedAvatarEntries)
       if (cachedContacts.length > 0) {
         syncContactTypeCounts(Object.values(cachedContactMap))
-        setSessions(toSessionRowsWithContacts([], cachedContactMap))
+        setSessions(toSessionRowsWithContacts([], cachedContactMap).filter(isExportConversationSession))
         setSessionDataSource('cache')
         setIsLoading(false)
       }
@@ -2741,7 +2745,7 @@ function ExportPage() {
 
       if (sessionsResult.success && sessionsResult.sessions) {
         const rawSessions = sessionsResult.sessions
-        const baseSessions = toSessionRowsWithContacts(rawSessions, cachedContactMap)
+        const baseSessions = toSessionRowsWithContacts(rawSessions, cachedContactMap).filter(isExportConversationSession)
         const exportableSessionIds = baseSessions
           .filter((session) => session.hasSession)
           .map((session) => session.username)
@@ -2934,7 +2938,7 @@ function ExportPage() {
             }, contactMap)
 
             if (isStale()) return
-            const nextSessions = toSessionRowsWithContacts(rawSessions, contactMap)
+            const nextSessions = toSessionRowsWithContacts(rawSessions, contactMap).filter(isExportConversationSession)
               .map((session) => {
                 const extra = extraContactMap[session.username]
                 const displayName = extra?.displayName || session.displayName || session.username
@@ -3028,6 +3032,12 @@ function ExportPage() {
     setIsLoadingSessionCounts(false)
     setSnsUserPostCountsStatus(prev => (prev === 'loading' ? 'idle' : prev))
   }, [isExportRoute])
+
+  useEffect(() => {
+    if (activeTab === 'official') {
+      setActiveTab('private')
+    }
+  }, [activeTab])
 
   useEffect(() => {
     activeTabRef.current = activeTab
@@ -4068,8 +4078,7 @@ function ExportPage() {
   const activeTabLabel = useMemo(() => {
     if (activeTab === 'private') return '私聊'
     if (activeTab === 'group') return '群聊'
-    if (activeTab === 'former_friend') return '曾经的好友'
-    return '公众号'
+    return '曾经的好友'
   }, [activeTab])
   const shouldShowSnsColumn = useMemo(() => (
     activeTab === 'private' || activeTab === 'former_friend'
@@ -4229,11 +4238,11 @@ function ExportPage() {
   }, [])
 
   const sessionLoadDetailRows = useMemo(() => {
-    const tabOrder: ConversationTab[] = ['private', 'group', 'official', 'former_friend']
+    const tabOrder: ConversationTab[] = ['private', 'group', 'former_friend']
     return tabOrder.map((tab) => {
       const sessionIds = loadDetailTargetsByTab[tab] || []
       const snsSessionIds = sessionIds.filter((sessionId) => isSingleContactSession(sessionId))
-      const snsPostCounts = tab === 'private' || tab === 'former_friend'
+      const snsPostCounts = tab === 'private'
         ? summarizeLoadTraceForTab(snsSessionIds, 'snsPostCounts')
         : createNotApplicableLoadSummary()
       return {
@@ -5380,9 +5389,6 @@ function ExportPage() {
                   <button className={`tab-btn ${activeTab === 'group' ? 'active' : ''}`} onClick={() => setActiveTab('group')}>
                     群聊 {isTabCountComputing ? <span className="count-loading">计算中<span className="animated-ellipsis" aria-hidden="true">...</span></span> : tabCounts.group}
                   </button>
-                  <button className={`tab-btn ${activeTab === 'official' ? 'active' : ''}`} onClick={() => setActiveTab('official')}>
-                    公众号 {isTabCountComputing ? <span className="count-loading">计算中<span className="animated-ellipsis" aria-hidden="true">...</span></span> : tabCounts.official}
-                  </button>
                   <button className={`tab-btn ${activeTab === 'former_friend' ? 'active' : ''}`} onClick={() => setActiveTab('former_friend')}>
                     曾经的好友 {isTabCountComputing ? <span className="count-loading">计算中<span className="animated-ellipsis" aria-hidden="true">...</span></span> : tabCounts.former_friend}
                   </button>
@@ -5635,7 +5641,9 @@ function ExportPage() {
                         <span>开始时间</span>
                         <span>完成时间</span>
                       </div>
-                      {sessionLoadDetailRows.map((row) => {
+                      {sessionLoadDetailRows
+                        .filter((row) => row.tab === 'private')
+                        .map((row) => {
                         const pulse = sessionLoadProgressPulseMap[`snsPostCounts:${row.tab}`]
                         const isLoading = row.snsPostCounts.statusLabel.startsWith('加载中')
                         return (
