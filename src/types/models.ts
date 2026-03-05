@@ -7,6 +7,7 @@ export interface ChatSession {
   sortTimestamp: number  // 用于排序
   lastTimestamp: number  // 用于显示时间
   lastMsgType: number
+  messageCountHint?: number // 会话总消息数提示（若底层直接可取）
   displayName?: string
   avatarUrl?: string
   lastMsgSender?: string
@@ -33,6 +34,7 @@ export interface ContactInfo {
   displayName: string
   remark?: string
   nickname?: string
+  alias?: string
   avatarUrl?: string
   type: 'friend' | 'group' | 'official' | 'former_friend' | 'other'
 }
