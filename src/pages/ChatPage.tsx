@@ -5194,13 +5194,13 @@ function MessageBubble({
     imageClickTimerRef.current = window.setTimeout(() => {
       setImageClicked(false)
     }, 800)
-    console.info('[UI] image decrypt click', {
+    console.info('[UI] image decrypt click (force HD)', {
       sessionId: session.username,
       imageMd5: message.imageMd5,
       imageDatName: message.imageDatName,
       localId: message.localId
     })
-    void requestImageDecrypt()
+    void requestImageDecrypt(true)
   }, [message.imageDatName, message.imageMd5, message.localId, requestImageDecrypt, session.username])
 
   const handleOpenImageViewer = useCallback(async () => {
