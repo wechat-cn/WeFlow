@@ -260,6 +260,214 @@
   flex-shrink: 0;
 }
 
+.session-mutual-friends-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.42);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2250;
+  padding: 20px;
+}
+
+.session-mutual-friends-modal {
+  width: min(760px, 100%);
+  max-height: min(82vh, 900px);
+  overflow: hidden;
+  border-radius: 16px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  box-shadow: 0 22px 46px rgba(0, 0, 0, 0.28);
+  display: flex;
+  flex-direction: column;
+}
+
+.session-mutual-friends-header {
+  padding: 16px;
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.session-mutual-friends-header-main {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.session-mutual-friends-avatar {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, var(--primary), var(--primary-hover));
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  flex-shrink: 0;
+
+  img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  span {
+    color: #fff;
+    font-size: 16px;
+    font-weight: 700;
+  }
+}
+
+.session-mutual-friends-meta {
+  min-width: 0;
+
+  h4 {
+    margin: 0;
+    font-size: 16px;
+    color: var(--text-primary);
+  }
+}
+
+.session-mutual-friends-stats {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.session-mutual-friends-close {
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  width: 30px;
+  height: 30px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+
+  &:hover {
+    color: var(--text-primary);
+    border-color: var(--text-tertiary);
+  }
+}
+
+.session-mutual-friends-tip {
+  margin: 14px 16px 0;
+  padding: 11px 12px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--primary) 28%, var(--border-color));
+  background: color-mix(in srgb, var(--primary) 10%, var(--bg-secondary));
+  color: var(--text-primary);
+  font-size: 14px;
+  line-height: 1.5;
+  font-weight: 700;
+}
+
+.session-mutual-friends-toolbar {
+  padding: 12px 16px 0;
+
+  input {
+    width: 100%;
+    height: 38px;
+    border-radius: 10px;
+    border: 1px solid var(--border-color);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    padding: 0 12px;
+    font-size: 13px;
+
+    &:focus {
+      outline: none;
+      border-color: color-mix(in srgb, var(--primary) 58%, var(--border-color));
+    }
+  }
+}
+
+.session-mutual-friends-body {
+  padding: 14px 16px 16px;
+  overflow: auto;
+  min-height: 220px;
+}
+
+.session-mutual-friends-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.session-mutual-friends-row {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) 96px 72px 110px;
+  gap: 10px;
+  align-items: center;
+  padding: 11px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border-color) 68%, transparent);
+  font-size: 13px;
+  color: var(--text-secondary);
+
+  &:last-child {
+    border-bottom: none;
+  }
+}
+
+.session-mutual-friends-rank,
+.session-mutual-friends-count,
+.session-mutual-friends-latest {
+  font-variant-numeric: tabular-nums;
+}
+
+.session-mutual-friends-rank {
+  color: var(--text-tertiary);
+}
+
+.session-mutual-friends-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.session-mutual-friends-source {
+  justify-self: start;
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 11px;
+  line-height: 1;
+  border: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+
+  &.both {
+    color: var(--primary);
+    border-color: color-mix(in srgb, var(--primary) 35%, var(--border-color));
+    background: color-mix(in srgb, var(--primary) 10%, var(--bg-secondary));
+  }
+}
+
+.session-mutual-friends-count,
+.session-mutual-friends-latest {
+  text-align: right;
+}
+
+.session-mutual-friends-empty {
+  min-height: 220px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary);
+  font-size: 13px;
+}
+
 .global-export-controls {
   flex: 0 1 980px;
   width: min(980px, 100%);
@@ -1707,6 +1915,21 @@
 
     &.loading {
       color: var(--text-tertiary);
+    }
+
+    &:disabled {
+      color: var(--text-secondary);
+      cursor: default;
+      text-decoration: none;
+      opacity: 0.78;
+    }
+  }
+
+  .row-mutual-friends-btn.ready {
+    color: #0f766e;
+
+    &:hover:not(:disabled) {
+      color: #115e59;
     }
   }
 
@@ -3591,6 +3814,17 @@
 
   .session-load-detail-modal {
     width: min(94vw, 820px);
+  }
+
+  .session-mutual-friends-modal {
+    width: min(94vw, 760px);
+    max-height: 86vh;
+  }
+
+  .session-mutual-friends-row {
+    grid-template-columns: 34px minmax(0, 1fr) 82px 56px 88px;
+    gap: 8px;
+    font-size: 12px;
   }
 
   .session-load-detail-row {

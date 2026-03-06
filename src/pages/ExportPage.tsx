@@ -564,6 +564,25 @@ interface SessionSnsRankItem {
   latestTime: number
 }
 
+type SessionMutualFriendSource = 'likes' | 'comments' | 'both'
+
+interface SessionMutualFriendItem {
+  name: string
+  likeCount: number
+  commentCount: number
+  totalCount: number
+  latestTime: number
+  source: SessionMutualFriendSource
+}
+
+interface SessionMutualFriendsMetric {
+  count: number
+  items: SessionMutualFriendItem[]
+  loadedPosts: number
+  totalPosts: number | null
+  computedAt: number
+}
+
 interface SessionSnsRankCacheEntry {
   likes: SessionSnsRankItem[]
   comments: SessionSnsRankItem[]
@@ -615,6 +634,79 @@ const buildSessionSnsRankings = (posts: SnsPost[]): { likes: SessionSnsRankItem[
   }
 }
 
+const buildSessionMutualFriendsMetric = (
+  posts: SnsPost[],
+  totalPosts: number | null
+): SessionMutualFriendsMetric => {
+  const friendMap = new Map<string, SessionMutualFriendItem>()
+
+  for (const post of posts) {
+    const createTime = Number(post?.createTime) || 0
+    const likes = Array.isArray(post?.likes) ? post.likes : []
+    const comments = Array.isArray(post?.comments) ? post.comments : []
+
+    for (const likeNameRaw of likes) {
+      const name = String(likeNameRaw || '').trim() || '未知用户'
+      const existing = friendMap.get(name)
+      if (existing) {
+        existing.likeCount += 1
+        existing.totalCount += 1
+        existing.source = existing.commentCount > 0 ? 'both' : 'likes'
+        if (createTime > existing.latestTime) existing.latestTime = createTime
+        continue
+      }
+      friendMap.set(name, {
+        name,
+        likeCount: 1,
+        commentCount: 0,
+        totalCount: 1,
+        latestTime: createTime,
+        source: 'likes'
+      })
+    }
+
+    for (const comment of comments) {
+      const name = String(comment?.nickname || '').trim() || '未知用户'
+      const existing = friendMap.get(name)
+      if (existing) {
+        existing.commentCount += 1
+        existing.totalCount += 1
+        existing.source = existing.likeCount > 0 ? 'both' : 'comments'
+        if (createTime > existing.latestTime) existing.latestTime = createTime
+        continue
+      }
+      friendMap.set(name, {
+        name,
+        likeCount: 0,
+        commentCount: 1,
+        totalCount: 1,
+        latestTime: createTime,
+        source: 'comments'
+      })
+    }
+  }
+
+  const items = [...friendMap.values()].sort((a, b) => {
+    if (b.totalCount !== a.totalCount) return b.totalCount - a.totalCount
+    if (b.latestTime !== a.latestTime) return b.latestTime - a.latestTime
+    return a.name.localeCompare(b.name, 'zh-CN')
+  })
+
+  return {
+    count: items.length,
+    items,
+    loadedPosts: posts.length,
+    totalPosts,
+    computedAt: Date.now()
+  }
+}
+
+const getSessionMutualFriendSourceLabel = (source: SessionMutualFriendSource): string => {
+  if (source === 'both') return '点赞/评论'
+  if (source === 'likes') return '仅点赞'
+  return '仅评论'
+}
+
 interface SessionExportMetric {
   totalMessages: number
   voiceMessages: number
@@ -664,6 +756,7 @@ interface SessionLoadTraceState {
   messageCount: SessionLoadStageState
   mediaMetrics: SessionLoadStageState
   snsPostCounts: SessionLoadStageState
+  mutualFriends: SessionLoadStageState
 }
 
 interface SessionLoadStageSummary {
@@ -899,7 +992,8 @@ const createDefaultSessionLoadStage = (): SessionLoadStageState => ({ status: 'p
 const createDefaultSessionLoadTrace = (): SessionLoadTraceState => ({
   messageCount: createDefaultSessionLoadStage(),
   mediaMetrics: createDefaultSessionLoadStage(),
-  snsPostCounts: createDefaultSessionLoadStage()
+  snsPostCounts: createDefaultSessionLoadStage(),
+  mutualFriends: createDefaultSessionLoadStage()
 })
 
 const WriteLayoutSelector = memo(function WriteLayoutSelector({
@@ -1274,6 +1368,9 @@ function ExportPage() {
   const [sessionSnsRankError, setSessionSnsRankError] = useState<string | null>(null)
   const [sessionSnsRankLoadedPosts, setSessionSnsRankLoadedPosts] = useState(0)
   const [sessionSnsRankTotalPosts, setSessionSnsRankTotalPosts] = useState<number | null>(null)
+  const [sessionMutualFriendsMetrics, setSessionMutualFriendsMetrics] = useState<Record<string, SessionMutualFriendsMetric>>({})
+  const [sessionMutualFriendsDialogTarget, setSessionMutualFriendsDialogTarget] = useState<SessionSnsTimelineTarget | null>(null)
+  const [sessionMutualFriendsSearch, setSessionMutualFriendsSearch] = useState('')
 
   const [exportFolder, setExportFolder] = useState('')
   const [writeLayout, setWriteLayout] = useState<configService.ExportWriteLayout>('B')
@@ -1398,6 +1495,18 @@ function ExportPage() {
     startIndex: 0,
     endIndex: -1
   })
+  const sessionMutualFriendsMetricsRef = useRef<Record<string, SessionMutualFriendsMetric>>({})
+  const sessionMutualFriendsQueueRef = useRef<string[]>([])
+  const sessionMutualFriendsQueuedSetRef = useRef<Set<string>>(new Set())
+  const sessionMutualFriendsLoadingSetRef = useRef<Set<string>>(new Set())
+  const sessionMutualFriendsReadySetRef = useRef<Set<string>>(new Set())
+  const sessionMutualFriendsRunIdRef = useRef(0)
+  const sessionMutualFriendsWorkerRunningRef = useRef(false)
+  const sessionMutualFriendsBackgroundFeedTimerRef = useRef<number | null>(null)
+  const sessionMutualFriendsVisibleRangeRef = useRef<{ startIndex: number; endIndex: number }>({
+    startIndex: 0,
+    endIndex: -1
+  })
 
   const ensureExportCacheScope = useCallback(async (): Promise<string> => {
     if (exportCacheScopeReadyRef.current) {
@@ -1454,6 +1563,10 @@ function ExportPage() {
   useEffect(() => {
     sessionContentMetricsRef.current = sessionContentMetrics
   }, [sessionContentMetrics])
+
+  useEffect(() => {
+    sessionMutualFriendsMetricsRef.current = sessionMutualFriendsMetrics
+  }, [sessionMutualFriendsMetrics])
 
   const patchSessionLoadTraceStage = useCallback((
     sessionIds: string[],
@@ -2223,6 +2336,24 @@ function ExportPage() {
     })
   }, [openSessionSnsTimelineByTarget])
 
+  const openSessionMutualFriendsDialog = useCallback((contact: ContactInfo) => {
+    const normalizedSessionId = String(contact?.username || '').trim()
+    if (!normalizedSessionId || !isSingleContactSession(normalizedSessionId)) return
+    const metric = sessionMutualFriendsMetricsRef.current[normalizedSessionId]
+    if (!metric) return
+    setSessionMutualFriendsSearch('')
+    setSessionMutualFriendsDialogTarget({
+      username: normalizedSessionId,
+      displayName: contact.displayName || contact.remark || contact.nickname || normalizedSessionId,
+      avatarUrl: contact.avatarUrl
+    })
+  }, [])
+
+  const closeSessionMutualFriendsDialog = useCallback(() => {
+    setSessionMutualFriendsDialogTarget(null)
+    setSessionMutualFriendsSearch('')
+  }, [])
+
   const loadMoreSessionSnsTimeline = useCallback(() => {
     if (!sessionSnsTimelineTarget || sessionSnsTimelineLoading || sessionSnsTimelineLoadingMore || !sessionSnsTimelineHasMore) return
     void loadSessionSnsTimelinePosts(sessionSnsTimelineTarget, { reset: false })
@@ -2503,6 +2634,61 @@ function ExportPage() {
     }, SESSION_MEDIA_METRIC_CACHE_FLUSH_DELAY_MS)
   }, [flushSessionMediaMetricCache])
 
+  const resetSessionMutualFriendsLoader = useCallback(() => {
+    sessionMutualFriendsRunIdRef.current += 1
+    sessionMutualFriendsQueueRef.current = []
+    sessionMutualFriendsQueuedSetRef.current.clear()
+    sessionMutualFriendsLoadingSetRef.current.clear()
+    sessionMutualFriendsReadySetRef.current.clear()
+    sessionMutualFriendsWorkerRunningRef.current = false
+    sessionMutualFriendsVisibleRangeRef.current = { startIndex: 0, endIndex: -1 }
+    if (sessionMutualFriendsBackgroundFeedTimerRef.current) {
+      window.clearTimeout(sessionMutualFriendsBackgroundFeedTimerRef.current)
+      sessionMutualFriendsBackgroundFeedTimerRef.current = null
+    }
+  }, [])
+
+  const isSessionMutualFriendsReady = useCallback((sessionId: string): boolean => {
+    if (!sessionId) return true
+    if (sessionMutualFriendsReadySetRef.current.has(sessionId)) return true
+    const existing = sessionMutualFriendsMetricsRef.current[sessionId]
+    if (existing && typeof existing.count === 'number' && Array.isArray(existing.items)) {
+      sessionMutualFriendsReadySetRef.current.add(sessionId)
+      return true
+    }
+    return false
+  }, [])
+
+  const enqueueSessionMutualFriendsRequests = useCallback((sessionIds: string[], options?: { front?: boolean }) => {
+    const front = options?.front === true
+    const incoming: string[] = []
+    for (const sessionIdRaw of sessionIds) {
+      const sessionId = String(sessionIdRaw || '').trim()
+      if (!sessionId) continue
+      if (sessionMutualFriendsQueuedSetRef.current.has(sessionId)) continue
+      if (sessionMutualFriendsLoadingSetRef.current.has(sessionId)) continue
+      if (isSessionMutualFriendsReady(sessionId)) continue
+      sessionMutualFriendsQueuedSetRef.current.add(sessionId)
+      incoming.push(sessionId)
+    }
+    if (incoming.length === 0) return
+    patchSessionLoadTraceStage(incoming, 'mutualFriends', 'pending')
+    if (front) {
+      sessionMutualFriendsQueueRef.current = [...incoming, ...sessionMutualFriendsQueueRef.current]
+    } else {
+      sessionMutualFriendsQueueRef.current.push(...incoming)
+    }
+  }, [isSessionMutualFriendsReady, patchSessionLoadTraceStage])
+
+  const hasPendingMetricLoads = useCallback((): boolean => (
+    isLoadingSessionCountsRef.current ||
+    sessionMediaMetricQueuedSetRef.current.size > 0 ||
+    sessionMediaMetricLoadingSetRef.current.size > 0 ||
+    sessionMediaMetricWorkerRunningRef.current ||
+    snsUserPostCountsStatus === 'loading' ||
+    snsUserPostCountsStatus === 'idle'
+  ), [snsUserPostCountsStatus])
+
   const isSessionMediaMetricReady = useCallback((sessionId: string): boolean => {
     if (!sessionId) return true
     if (sessionMediaMetricReadySetRef.current.has(sessionId)) return true
@@ -2645,6 +2831,104 @@ function ExportPage() {
     const runId = sessionMediaMetricRunIdRef.current
     void runSessionMediaMetricWorker(runId)
   }, [isSessionCountStageReady, runSessionMediaMetricWorker])
+
+  const loadSessionMutualFriendsMetric = useCallback(async (sessionId: string): Promise<SessionMutualFriendsMetric> => {
+    const normalizedSessionId = String(sessionId || '').trim()
+    const hasKnownTotal = Object.prototype.hasOwnProperty.call(snsUserPostCounts, normalizedSessionId)
+    const knownTotalRaw = hasKnownTotal ? Number(snsUserPostCounts[normalizedSessionId] || 0) : NaN
+    const knownTotal = Number.isFinite(knownTotalRaw) ? Math.max(0, Math.floor(knownTotalRaw)) : null
+    const allPosts: SnsPost[] = []
+    let endTime: number | undefined
+    let hasMore = true
+
+    while (hasMore) {
+      const result = await window.electronAPI.sns.getTimeline(
+        SNS_RANK_PAGE_SIZE,
+        0,
+        [normalizedSessionId],
+        '',
+        undefined,
+        endTime
+      )
+      if (!result.success) {
+        throw new Error(result.error || '共同好友统计失败')
+      }
+
+      const pagePosts = Array.isArray(result.timeline)
+        ? [...(result.timeline as SnsPost[])].sort((a, b) => b.createTime - a.createTime)
+        : []
+      if (pagePosts.length === 0) {
+        hasMore = false
+        break
+      }
+
+      allPosts.push(...pagePosts)
+      endTime = pagePosts[pagePosts.length - 1].createTime - 1
+      hasMore = pagePosts.length >= SNS_RANK_PAGE_SIZE
+    }
+
+    return buildSessionMutualFriendsMetric(allPosts, knownTotal)
+  }, [snsUserPostCounts])
+
+  const runSessionMutualFriendsWorker = useCallback(async (runId: number) => {
+    if (sessionMutualFriendsWorkerRunningRef.current) return
+    sessionMutualFriendsWorkerRunningRef.current = true
+    try {
+      while (runId === sessionMutualFriendsRunIdRef.current) {
+        if (hasPendingMetricLoads()) {
+          await new Promise(resolve => window.setTimeout(resolve, 120))
+          continue
+        }
+
+        const sessionId = sessionMutualFriendsQueueRef.current.shift()
+        if (!sessionId) break
+        sessionMutualFriendsQueuedSetRef.current.delete(sessionId)
+        if (sessionMutualFriendsLoadingSetRef.current.has(sessionId)) continue
+        if (isSessionMutualFriendsReady(sessionId)) continue
+
+        sessionMutualFriendsLoadingSetRef.current.add(sessionId)
+        patchSessionLoadTraceStage([sessionId], 'mutualFriends', 'loading')
+
+        try {
+          const metric = await loadSessionMutualFriendsMetric(sessionId)
+          if (runId !== sessionMutualFriendsRunIdRef.current) return
+          setSessionMutualFriendsMetrics(prev => ({
+            ...prev,
+            [sessionId]: metric
+          }))
+          sessionMutualFriendsReadySetRef.current.add(sessionId)
+          patchSessionLoadTraceStage([sessionId], 'mutualFriends', 'done')
+        } catch (error) {
+          console.error('导出页加载共同好友统计失败:', error)
+          patchSessionLoadTraceStage([sessionId], 'mutualFriends', 'failed', {
+            error: error instanceof Error ? error.message : String(error)
+          })
+        } finally {
+          sessionMutualFriendsLoadingSetRef.current.delete(sessionId)
+        }
+
+        await new Promise(resolve => window.setTimeout(resolve, 0))
+      }
+    } finally {
+      sessionMutualFriendsWorkerRunningRef.current = false
+      if (runId === sessionMutualFriendsRunIdRef.current && sessionMutualFriendsQueueRef.current.length > 0) {
+        void runSessionMutualFriendsWorker(runId)
+      }
+    }
+  }, [
+    hasPendingMetricLoads,
+    isSessionMutualFriendsReady,
+    loadSessionMutualFriendsMetric,
+    patchSessionLoadTraceStage
+  ])
+
+  const scheduleSessionMutualFriendsWorker = useCallback(() => {
+    if (!isSessionCountStageReady) return
+    if (hasPendingMetricLoads()) return
+    if (sessionMutualFriendsWorkerRunningRef.current) return
+    const runId = sessionMutualFriendsRunIdRef.current
+    void runSessionMutualFriendsWorker(runId)
+  }, [hasPendingMetricLoads, isSessionCountStageReady, runSessionMutualFriendsWorker])
 
   const loadSessionMessageCounts = useCallback(async (
     sourceSessions: SessionRow[],
@@ -2800,11 +3084,16 @@ function ExportPage() {
     sessionsHydratedAtRef.current = 0
     sessionPreciseRefreshAtRef.current = {}
     resetSessionMediaMetricLoader()
+    resetSessionMutualFriendsLoader()
     setIsLoading(true)
     setIsSessionEnriching(false)
     sessionCountRequestIdRef.current += 1
     setSessionMessageCounts({})
     setSessionContentMetrics({})
+    setSessionMutualFriendsMetrics({})
+    sessionMutualFriendsMetricsRef.current = {}
+    setSessionMutualFriendsDialogTarget(null)
+    setSessionMutualFriendsSearch('')
     setSessionLoadTraceMap({})
     setSessionLoadProgressPulseMap({})
     sessionLoadProgressSnapshotRef.current = {}
@@ -3110,7 +3399,7 @@ function ExportPage() {
     } finally {
       if (!isStale()) setIsLoading(false)
     }
-  }, [ensureExportCacheScope, loadContactsCaches, loadSessionMessageCounts, mergeSessionContentMetrics, patchSessionLoadTraceStage, resetSessionMediaMetricLoader, syncContactTypeCounts])
+  }, [ensureExportCacheScope, loadContactsCaches, loadSessionMessageCounts, mergeSessionContentMetrics, patchSessionLoadTraceStage, resetSessionMediaMetricLoader, resetSessionMutualFriendsLoader, syncContactTypeCounts])
 
   useEffect(() => {
     if (!isExportRoute) return
@@ -3147,10 +3436,11 @@ function ExportPage() {
       window.clearTimeout(snsUserPostCountsBatchTimerRef.current)
       snsUserPostCountsBatchTimerRef.current = null
     }
+    resetSessionMutualFriendsLoader()
     setIsSessionEnriching(false)
     setIsLoadingSessionCounts(false)
     setSnsUserPostCountsStatus(prev => (prev === 'loading' ? 'idle' : prev))
-  }, [isExportRoute])
+  }, [isExportRoute, resetSessionMutualFriendsLoader])
 
   useEffect(() => {
     if (activeTab === 'official') {
@@ -4038,6 +4328,7 @@ function ExportPage() {
   const shouldShowSnsColumn = useMemo(() => (
     activeTab === 'private' || activeTab === 'former_friend'
   ), [activeTab])
+  const shouldShowMutualFriendsColumn = shouldShowSnsColumn
 
   const sessionRowByUsername = useMemo(() => {
     const map = new Map<string, SessionRow>()
@@ -4197,15 +4488,19 @@ function ExportPage() {
     return tabOrder.map((tab) => {
       const sessionIds = loadDetailTargetsByTab[tab] || []
       const snsSessionIds = sessionIds.filter((sessionId) => isSingleContactSession(sessionId))
-      const snsPostCounts = tab === 'private'
+      const snsPostCounts = tab === 'private' || tab === 'former_friend'
         ? summarizeLoadTraceForTab(snsSessionIds, 'snsPostCounts')
+        : createNotApplicableLoadSummary()
+      const mutualFriends = tab === 'private' || tab === 'former_friend'
+        ? summarizeLoadTraceForTab(snsSessionIds, 'mutualFriends')
         : createNotApplicableLoadSummary()
       return {
         tab,
         label: conversationTabLabels[tab],
         messageCount: summarizeLoadTraceForTab(sessionIds, 'messageCount'),
         mediaMetrics: summarizeLoadTraceForTab(sessionIds, 'mediaMetrics'),
-        snsPostCounts
+        snsPostCounts,
+        mutualFriends
       }
     })
   }, [createNotApplicableLoadSummary, loadDetailTargetsByTab, summarizeLoadTraceForTab])
@@ -4225,7 +4520,7 @@ function ExportPage() {
     const nextSnapshot: Record<string, { loaded: number; total: number }> = {}
     const resetKeys: string[] = []
     const updates: Array<{ key: string; at: number; delta: number }> = []
-    const stageKeys: Array<keyof SessionLoadTraceState> = ['messageCount', 'mediaMetrics', 'snsPostCounts']
+    const stageKeys: Array<keyof SessionLoadTraceState> = ['messageCount', 'mediaMetrics', 'snsPostCounts', 'mutualFriends']
 
     for (const row of sessionLoadDetailRows) {
       for (const stageKey of stageKeys) {
@@ -4296,16 +4591,51 @@ function ExportPage() {
     return sessionIds
   }, [sessionRowByUsername])
 
+  const collectVisibleSessionMutualFriendsTargets = useCallback((sourceContacts: ContactInfo[]): string[] => {
+    if (sourceContacts.length === 0) return []
+    const startCandidate = sessionMutualFriendsVisibleRangeRef.current.startIndex
+    const endCandidate = sessionMutualFriendsVisibleRangeRef.current.endIndex
+    const startIndex = Math.max(0, Math.min(sourceContacts.length - 1, startCandidate >= 0 ? startCandidate : 0))
+    const visibleEnd = endCandidate >= startIndex
+      ? endCandidate
+      : Math.min(sourceContacts.length - 1, startIndex + 9)
+    const endIndex = Math.max(startIndex, Math.min(sourceContacts.length - 1, visibleEnd + SESSION_MEDIA_METRIC_PREFETCH_ROWS))
+    const sessionIds: string[] = []
+    for (let index = startIndex; index <= endIndex; index += 1) {
+      const contact = sourceContacts[index]
+      if (!contact?.username || !isSingleContactSession(contact.username)) continue
+      const mappedSession = sessionRowByUsername.get(contact.username)
+      if (!mappedSession?.hasSession) continue
+      sessionIds.push(contact.username)
+    }
+    return sessionIds
+  }, [sessionRowByUsername])
+
   const handleContactsRangeChanged = useCallback((range: { startIndex: number; endIndex: number }) => {
     const startIndex = Number.isFinite(range?.startIndex) ? Math.max(0, Math.floor(range.startIndex)) : 0
     const endIndex = Number.isFinite(range?.endIndex) ? Math.max(startIndex, Math.floor(range.endIndex)) : startIndex
     sessionMediaMetricVisibleRangeRef.current = { startIndex, endIndex }
+    sessionMutualFriendsVisibleRangeRef.current = { startIndex, endIndex }
     if (isLoadingSessionCountsRef.current || !isSessionCountStageReady) return
     const visibleTargets = collectVisibleSessionMetricTargets(filteredContacts)
     if (visibleTargets.length === 0) return
     enqueueSessionMediaMetricRequests(visibleTargets, { front: true })
     scheduleSessionMediaMetricWorker()
-  }, [collectVisibleSessionMetricTargets, enqueueSessionMediaMetricRequests, filteredContacts, isSessionCountStageReady, scheduleSessionMediaMetricWorker])
+    const visibleMutualFriendsTargets = collectVisibleSessionMutualFriendsTargets(filteredContacts)
+    if (visibleMutualFriendsTargets.length > 0) {
+      enqueueSessionMutualFriendsRequests(visibleMutualFriendsTargets, { front: true })
+      scheduleSessionMutualFriendsWorker()
+    }
+  }, [
+    collectVisibleSessionMetricTargets,
+    collectVisibleSessionMutualFriendsTargets,
+    enqueueSessionMediaMetricRequests,
+    enqueueSessionMutualFriendsRequests,
+    filteredContacts,
+    isSessionCountStageReady,
+    scheduleSessionMediaMetricWorker,
+    scheduleSessionMutualFriendsWorker
+  ])
 
   useEffect(() => {
     if (!isSessionCountStageReady || filteredContacts.length === 0) return
@@ -4364,6 +4694,61 @@ function ExportPage() {
   ])
 
   useEffect(() => {
+    if (!isSessionCountStageReady || filteredContacts.length === 0) return
+    const runId = sessionMutualFriendsRunIdRef.current
+    const visibleTargets = collectVisibleSessionMutualFriendsTargets(filteredContacts)
+    if (visibleTargets.length > 0) {
+      enqueueSessionMutualFriendsRequests(visibleTargets, { front: true })
+      scheduleSessionMutualFriendsWorker()
+    }
+
+    if (sessionMutualFriendsBackgroundFeedTimerRef.current) {
+      window.clearTimeout(sessionMutualFriendsBackgroundFeedTimerRef.current)
+      sessionMutualFriendsBackgroundFeedTimerRef.current = null
+    }
+
+    const visibleTargetSet = new Set(visibleTargets)
+    let cursor = 0
+    const feedNext = () => {
+      if (runId !== sessionMutualFriendsRunIdRef.current) return
+      const batchIds: string[] = []
+      while (cursor < filteredContacts.length && batchIds.length < SESSION_MEDIA_METRIC_BACKGROUND_FEED_SIZE) {
+        const contact = filteredContacts[cursor]
+        cursor += 1
+        if (!contact?.username || !isSingleContactSession(contact.username)) continue
+        if (visibleTargetSet.has(contact.username)) continue
+        const mappedSession = sessionRowByUsername.get(contact.username)
+        if (!mappedSession?.hasSession) continue
+        batchIds.push(contact.username)
+      }
+
+      if (batchIds.length > 0) {
+        enqueueSessionMutualFriendsRequests(batchIds)
+        scheduleSessionMutualFriendsWorker()
+      }
+
+      if (cursor < filteredContacts.length) {
+        sessionMutualFriendsBackgroundFeedTimerRef.current = window.setTimeout(feedNext, SESSION_MEDIA_METRIC_BACKGROUND_FEED_INTERVAL_MS)
+      }
+    }
+
+    feedNext()
+    return () => {
+      if (sessionMutualFriendsBackgroundFeedTimerRef.current) {
+        window.clearTimeout(sessionMutualFriendsBackgroundFeedTimerRef.current)
+        sessionMutualFriendsBackgroundFeedTimerRef.current = null
+      }
+    }
+  }, [
+    collectVisibleSessionMutualFriendsTargets,
+    enqueueSessionMutualFriendsRequests,
+    filteredContacts,
+    isSessionCountStageReady,
+    scheduleSessionMutualFriendsWorker,
+    sessionRowByUsername
+  ])
+
+  useEffect(() => {
     return () => {
       snsUserPostCountsHydrationTokenRef.current += 1
       if (snsUserPostCountsBatchTimerRef.current) {
@@ -4377,6 +4762,10 @@ function ExportPage() {
       if (sessionMediaMetricPersistTimerRef.current) {
         window.clearTimeout(sessionMediaMetricPersistTimerRef.current)
         sessionMediaMetricPersistTimerRef.current = null
+      }
+      if (sessionMutualFriendsBackgroundFeedTimerRef.current) {
+        window.clearTimeout(sessionMutualFriendsBackgroundFeedTimerRef.current)
+        sessionMutualFriendsBackgroundFeedTimerRef.current = null
       }
       void flushSessionMediaMetricCache()
     }
@@ -4419,6 +4808,19 @@ function ExportPage() {
     const normalized = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0
     return `朋友圈：${normalized}条`
   }, [sessionDetail?.wxid, sessionDetailSupportsSnsTimeline, snsUserPostCounts, snsUserPostCountsStatus])
+
+  const sessionMutualFriendsDialogMetric = useMemo(() => {
+    const sessionId = String(sessionMutualFriendsDialogTarget?.username || '').trim()
+    if (!sessionId) return null
+    return sessionMutualFriendsMetrics[sessionId] || null
+  }, [sessionMutualFriendsDialogTarget, sessionMutualFriendsMetrics])
+
+  const filteredSessionMutualFriendsDialogItems = useMemo(() => {
+    const items = sessionMutualFriendsDialogMetric?.items || []
+    const keyword = sessionMutualFriendsSearch.trim().toLowerCase()
+    if (!keyword) return items
+    return items.filter(item => item.name.toLowerCase().includes(keyword))
+  }, [sessionMutualFriendsDialogMetric, sessionMutualFriendsSearch])
 
   const applySessionDetailStats = useCallback((
     sessionId: string,
@@ -4837,6 +5239,17 @@ function ExportPage() {
   }, [closeSessionSnsTimeline, sessionSnsTimelineTarget])
 
   useEffect(() => {
+    if (!sessionMutualFriendsDialogTarget) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeSessionMutualFriendsDialog()
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [closeSessionMutualFriendsDialog, sessionMutualFriendsDialogTarget])
+
+  useEffect(() => {
     if (!showSessionFormatSelect) return
     const handlePointerDown = (event: MouseEvent) => {
       const target = event.target as Node
@@ -4982,7 +5395,8 @@ function ExportPage() {
       const candidateTimes = [
         row.messageCount.finishedAt || row.messageCount.startedAt || 0,
         row.mediaMetrics.finishedAt || row.mediaMetrics.startedAt || 0,
-        row.snsPostCounts.finishedAt || row.snsPostCounts.startedAt || 0
+        row.snsPostCounts.finishedAt || row.snsPostCounts.startedAt || 0,
+        row.mutualFriends.finishedAt || row.mutualFriends.startedAt || 0
       ]
       for (const candidate of candidateTimes) {
         if (candidate > latest) {
@@ -5048,6 +5462,18 @@ function ExportPage() {
     )
     const snsRawCount = Number(snsUserPostCounts[contact.username] || 0)
     const snsCount = Number.isFinite(snsRawCount) ? Math.max(0, Math.floor(snsRawCount)) : 0
+    const mutualFriendsMetric = sessionMutualFriendsMetrics[contact.username]
+    const hasMutualFriendsMetric = Boolean(mutualFriendsMetric)
+    const mutualFriendsStageStatus = sessionLoadTraceMap[contact.username]?.mutualFriends?.status
+    const isMutualFriendsLoading = (
+      supportsSnsTimeline &&
+      canExport &&
+      !hasMutualFriendsMetric &&
+      (
+        mutualFriendsStageStatus === 'pending' ||
+        mutualFriendsStageStatus === 'loading'
+      )
+    )
     const openChatLabel = contact.type === 'friend'
       ? '打开私聊'
       : contact.type === 'group'
@@ -5152,6 +5578,27 @@ function ExportPage() {
               )}
             </div>
           )}
+          {shouldShowMutualFriendsColumn && (
+            <div className="row-media-metric">
+              {supportsSnsTimeline ? (
+                <button
+                  type="button"
+                  className={`row-sns-metric-btn row-mutual-friends-btn ${isMutualFriendsLoading ? 'loading' : ''} ${hasMutualFriendsMetric ? 'ready' : ''}`}
+                  title={`查看 ${contact.displayName || contact.username} 的共同好友`}
+                  onClick={() => openSessionMutualFriendsDialog(contact)}
+                  disabled={!hasMutualFriendsMetric}
+                >
+                  {isMutualFriendsLoading
+                    ? <Loader2 size={12} className="spin row-media-metric-icon" aria-label="共同好友统计加载中" />
+                    : hasMutualFriendsMetric
+                      ? mutualFriendsMetric.count.toLocaleString('zh-CN')
+                      : '--'}
+                </button>
+              ) : (
+                <strong className="row-media-metric-value">--</strong>
+              )}
+            </div>
+          )}
           <div className="row-action-cell">
             <div className={`row-action-main ${hasRecentExport ? '' : 'single-line'}`.trim()}>
               <div className={`row-export-action-stack ${hasRecentExport ? '' : 'single-line'}`.trim()}>
@@ -5187,18 +5634,21 @@ function ExportPage() {
     nowTick,
     openContactSnsTimeline,
     openSessionDetail,
+    openSessionMutualFriendsDialog,
     openSingleExport,
     queuedSessionIds,
     runningSessionIds,
     selectedSessions,
     sessionDetail?.wxid,
     sessionContentMetrics,
+    sessionMutualFriendsMetrics,
     sessionLoadTraceMap,
     sessionMessageCounts,
     sessionRowByUsername,
     isLoading,
     isSessionEnriching,
     showSessionDetailPanel,
+    shouldShowMutualFriendsColumn,
     shouldShowSnsColumn,
     snsUserPostCounts,
     snsUserPostCountsStatus,
@@ -5546,6 +5996,9 @@ function ExportPage() {
                   {shouldShowSnsColumn && (
                     <span className="contacts-list-header-media">朋友圈</span>
                   )}
+                  {shouldShowMutualFriendsColumn && (
+                    <span className="contacts-list-header-media">共同好友</span>
+                  )}
                   <span className="contacts-list-header-actions">
                     {selectedCount > 0 && (
                       <>
@@ -5742,7 +6195,7 @@ function ExportPage() {
                         <span>完成时间</span>
                       </div>
                       {sessionLoadDetailRows
-                        .filter((row) => row.tab === 'private')
+                        .filter((row) => row.tab === 'private' || row.tab === 'former_friend')
                         .map((row) => {
                         const pulse = sessionLoadProgressPulseMap[`snsPostCounts:${row.tab}`]
                         const isLoading = row.snsPostCounts.statusLabel.startsWith('加载中')
@@ -5767,6 +6220,121 @@ function ExportPage() {
                       })}
                     </div>
                   </section>
+
+                  <section className="session-load-detail-block">
+                    <h5>共同好友统计</h5>
+                    <div className="session-load-detail-table">
+                      <div className="session-load-detail-row header">
+                        <span>会话类型</span>
+                        <span>加载状态</span>
+                        <span>开始时间</span>
+                        <span>完成时间</span>
+                      </div>
+                      {sessionLoadDetailRows
+                        .filter((row) => row.tab === 'private' || row.tab === 'former_friend')
+                        .map((row) => {
+                          const pulse = sessionLoadProgressPulseMap[`mutualFriends:${row.tab}`]
+                          const isLoading = row.mutualFriends.statusLabel.startsWith('加载中')
+                          return (
+                            <div className="session-load-detail-row" key={`mutual-friends-${row.tab}`}>
+                              <span>{row.label}</span>
+                              <span className="session-load-detail-status-cell">
+                                <span>{row.mutualFriends.statusLabel}</span>
+                                {isLoading && (
+                                  <Loader2 size={12} className="spin session-load-detail-status-icon" aria-label="加载中" />
+                                )}
+                                {isLoading && pulse && pulse.delta > 0 && (
+                                  <span className="session-load-detail-progress-pulse">
+                                    {formatLoadDetailPulseTime(pulse.at)} +{pulse.delta}个
+                                  </span>
+                                )}
+                              </span>
+                              <span>{formatLoadDetailTime(row.mutualFriends.startedAt)}</span>
+                              <span>{formatLoadDetailTime(row.mutualFriends.finishedAt)}</span>
+                            </div>
+                          )
+                        })}
+                    </div>
+                  </section>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {sessionMutualFriendsDialogTarget && sessionMutualFriendsDialogMetric && (
+            <div
+              className="session-mutual-friends-overlay"
+              onClick={closeSessionMutualFriendsDialog}
+            >
+              <div
+                className="session-mutual-friends-modal"
+                role="dialog"
+                aria-modal="true"
+                aria-label="共同好友"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="session-mutual-friends-header">
+                  <div className="session-mutual-friends-header-main">
+                    <div className="session-mutual-friends-avatar">
+                      {sessionMutualFriendsDialogTarget.avatarUrl ? (
+                        <img src={sessionMutualFriendsDialogTarget.avatarUrl} alt="" />
+                      ) : (
+                        <span>{getAvatarLetter(sessionMutualFriendsDialogTarget.displayName)}</span>
+                      )}
+                    </div>
+                    <div className="session-mutual-friends-meta">
+                      <h4>{sessionMutualFriendsDialogTarget.displayName} 的共同好友</h4>
+                      <div className="session-mutual-friends-stats">
+                        共 {sessionMutualFriendsDialogMetric.count.toLocaleString('zh-CN')} 人
+                        {sessionMutualFriendsDialogMetric.totalPosts !== null
+                          ? ` · 已统计 ${sessionMutualFriendsDialogMetric.loadedPosts.toLocaleString('zh-CN')} / ${sessionMutualFriendsDialogMetric.totalPosts.toLocaleString('zh-CN')} 条朋友圈`
+                          : ` · 已统计 ${sessionMutualFriendsDialogMetric.loadedPosts.toLocaleString('zh-CN')} 条朋友圈`}
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    className="session-mutual-friends-close"
+                    type="button"
+                    onClick={closeSessionMutualFriendsDialog}
+                    aria-label="关闭共同好友弹窗"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+
+                <div className="session-mutual-friends-tip">
+                  打开桌面端微信，进入到这个人的朋友圈中，刷ta 的朋友圈，刷的越多这里的数据聚合越多
+                </div>
+
+                <div className="session-mutual-friends-toolbar">
+                  <input
+                    value={sessionMutualFriendsSearch}
+                    onChange={(event) => setSessionMutualFriendsSearch(event.target.value)}
+                    placeholder="搜索共同好友"
+                    aria-label="搜索共同好友"
+                  />
+                </div>
+
+                <div className="session-mutual-friends-body">
+                  {filteredSessionMutualFriendsDialogItems.length === 0 ? (
+                    <div className="session-mutual-friends-empty">
+                      {sessionMutualFriendsSearch.trim() ? '没有匹配的共同好友' : '暂无共同好友数据'}
+                    </div>
+                  ) : (
+                    <div className="session-mutual-friends-list">
+                      {filteredSessionMutualFriendsDialogItems.map((item, index) => (
+                        <div className="session-mutual-friends-row" key={`${sessionMutualFriendsDialogTarget.username}-${item.name}`}>
+                          <span className="session-mutual-friends-rank">{index + 1}</span>
+                          <span className="session-mutual-friends-name" title={item.name}>{item.name}</span>
+                          <span className={`session-mutual-friends-source ${item.source}`}>
+                            {getSessionMutualFriendSourceLabel(item.source)}
+                          </span>
+                          <span className="session-mutual-friends-count">{item.totalCount.toLocaleString('zh-CN')}</span>
+                          <span className="session-mutual-friends-latest">{formatYmdDateFromSeconds(item.latestTime)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
