@@ -121,10 +121,6 @@
       {
         "from": "electron/assets/wasm/",
         "to": "assets/wasm/"
-      },
-      {
-        "from": "resources/icon.icns",
-        "to": "icon.icns"
       }
     ],
     "files": [
