@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Search, MessageSquare, AlertCircle, Loader2, RefreshCw, X, ChevronDown, ChevronLeft, Info, Calendar, Database, Hash, Play, Pause, Image as ImageIcon, Link, Mic, CheckCircle, Copy, Check, CheckSquare, Download, BarChart3, Edit2, Trash2, BellOff, Users, FolderClosed, UserCheck, Crown, Aperture, LogOut } from 'lucide-react'
+import { Search, MessageSquare, MessageSquareOff, AlertCircle, Loader2, RefreshCw, X, ChevronDown, ChevronLeft, Info, Calendar, Database, Hash, Play, Pause, Image as ImageIcon, Link, Mic, CheckCircle, Copy, Check, CheckSquare, Download, BarChart3, Edit2, Trash2, BellOff, Users, FolderClosed, UserCheck, Crown, Aperture } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { createPortal } from 'react-dom'
 import { useChatStore } from '../stores/chatStore'
@@ -3915,7 +3915,7 @@ function ChatPage(props: ChatPageProps) {
                 aria-label={hideExitedGroups ? '显示已退出群聊' : '隐藏已退出群聊'}
                 aria-pressed={hideExitedGroups}
               >
-                <LogOut size={15} />
+                <MessageSquareOff size={15} />
               </button>
               <div className="search-box expanded">
                 <Search size={14} />
