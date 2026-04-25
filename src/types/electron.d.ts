@@ -35,6 +35,17 @@ export interface BackupOptions {
   includeFiles?: boolean
 }
 
+export interface BackupImageDatMeta {
+  version?: number
+  aesSize?: number
+  aes_size?: number
+  xorSize?: number
+  xor_size?: number
+  rawSize?: number
+  raw_size?: number
+  flag?: number
+}
+
 export interface BackupManifest {
   version: 1
   type: 'weflow-db-snapshots'
@@ -70,6 +81,7 @@ export interface BackupManifest {
       targetRelativePath: string
       ext?: string
       size?: number
+      datMeta?: BackupImageDatMeta
     }>
     videos?: Array<{
       kind: 'image' | 'video' | 'file'

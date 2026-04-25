@@ -1,5 +1,5 @@
 import { BrowserWindow, app } from 'electron'
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'fs'
+import { createWriteStream, existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'fs'
 import { copyFile, link, readFile as readFileAsync, mkdtemp, writeFile } from 'fs/promises'
 import { basename, dirname, join, relative, resolve, sep } from 'path'
 import { tmpdir } from 'os'
@@ -7,11 +7,13 @@ import * as tar from 'tar'
 import { ConfigService } from './config'
 import { wcdbService } from './wcdbService'
 import { expandHomePath } from '../utils/pathUtils'
-import { decryptDatViaNative, encryptDatViaNative } from './nativeImageDecrypt'
+import { decryptDatViaNative, encryptDatViaNative, type NativeDatMeta } from './nativeImageDecrypt'
 
 type BackupDbKind = 'session' | 'contact' | 'emoticon' | 'message' | 'media' | 'sns'
 type BackupPhase = 'preparing' | 'scanning' | 'exporting' | 'packing' | 'inspecting' | 'restoring' | 'done' | 'failed'
 type BackupResourceKind = 'image' | 'video' | 'file'
+const TEMP_MARKER = '.weflow-backup-temp'
+const TEMP_TTL_MS = 24 * 60 * 60 * 1000
 
 export interface BackupOptions {
   includeImages?: boolean
@@ -46,6 +48,7 @@ interface BackupResourceEntry {
   targetRelativePath: string
   ext?: string
   size?: number
+  datMeta?: NativeDatMeta
 }
 
 interface BackupManifest {
@@ -140,8 +143,42 @@ function hasResourceOptions(options: BackupOptions): boolean {
   return options.includeImages === true || options.includeVideos === true || options.includeFiles === true
 }
 
+function normalizeArchivePath(value: string): string {
+  return String(value || '').replace(/\\/g, '/')
+}
+
 export class BackupService {
   private configService = new ConfigService()
+  private cleanedTempDirs = false
+
+  private cleanupStaleTempDirs(): void {
+    if (this.cleanedTempDirs) return
+    this.cleanedTempDirs = true
+    const root = tmpdir()
+    const now = Date.now()
+    try {
+      for (const entry of readdirSync(root)) {
+        if (!entry.startsWith('weflow-backup-')) continue
+        const dir = join(root, entry)
+        const marker = join(dir, TEMP_MARKER)
+        try {
+          const stat = statSync(dir)
+          if (!stat.isDirectory()) continue
+          if (!existsSync(marker)) continue
+          const age = now - stat.mtimeMs
+          if (age < TEMP_TTL_MS) continue
+          rmSync(dir, { recursive: true, force: true })
+        } catch {}
+      }
+    } catch {}
+  }
+
+  private async createTempDir(prefix: string): Promise<string> {
+    this.cleanupStaleTempDirs()
+    const dir = await mkdtemp(join(tmpdir(), prefix))
+    await writeFile(join(dir, TEMP_MARKER), String(Date.now()), 'utf8')
+    return dir
+  }
 
   private buildWxidCandidates(wxid: string): string[] {
     const wxidCandidates = Array.from(new Set([
@@ -295,7 +332,7 @@ export class BackupService {
   }
 
   private resolveExtractedPath(extractDir: string, archivePath: string): string | null {
-    const normalized = String(archivePath || '').replace(/\\/g, '/')
+    const normalized = normalizeArchivePath(archivePath)
     if (!normalized || normalized.startsWith('/') || normalized.split('/').includes('..')) return null
     const root = resolve(extractDir)
     const target = resolve(join(extractDir, normalized))
@@ -303,8 +340,12 @@ export class BackupService {
     return target
   }
 
+  private resolveStagingPath(stagingDir: string, archivePath: string): string | null {
+    return this.resolveExtractedPath(stagingDir, archivePath)
+  }
+
   private resolveTargetResourcePath(accountDir: string, relativePath: string): string | null {
-    const normalized = String(relativePath || '').replace(/\\/g, '/')
+    const normalized = normalizeArchivePath(relativePath)
     if (!normalized || normalized.startsWith('/') || normalized.split('/').includes('..')) return null
     const root = resolve(accountDir)
     const target = resolve(join(accountDir, normalized))
@@ -349,6 +390,18 @@ export class BackupService {
     } catch {
       await copyFile(sourcePath, outputPath)
     }
+  }
+
+  private async writeTarEntryToFile(entry: any, outputPath: string): Promise<void> {
+    mkdirSync(dirname(outputPath), { recursive: true })
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      const out = createWriteStream(outputPath)
+      const fail = (error: unknown) => rejectPromise(error instanceof Error ? error : new Error(String(error)))
+      out.on('finish', resolvePromise)
+      out.on('error', fail)
+      entry.on('error', fail)
+      entry.pipe(out)
+    })
   }
 
   private async listChatImageDatFiles(accountDir: string): Promise<string[]> {
@@ -600,7 +653,8 @@ export class BackupService {
         archivePath,
         targetRelativePath: relativeTarget,
         ext: decrypted.ext || undefined,
-        size: decrypted.data.length
+        size: decrypted.data.length,
+        datMeta: decrypted.meta
       })
       if (index % 20 === 0) await delay()
     }
@@ -676,7 +730,7 @@ export class BackupService {
         return { success: false, error: connected.error || '数据库未连接' }
       }
 
-      stagingDir = await mkdtemp(join(tmpdir(), 'weflow-backup-'))
+      stagingDir = await this.createTempDir('weflow-backup-')
       const snapshotsDir = join(stagingDir, 'snapshots')
       mkdirSync(snapshotsDir, { recursive: true })
 
@@ -814,7 +868,7 @@ export class BackupService {
     let extractDir = ''
     try {
       emitBackupProgress({ phase: 'inspecting', message: '正在读取备份包' })
-      extractDir = await mkdtemp(join(tmpdir(), 'weflow-backup-inspect-'))
+      extractDir = await this.createTempDir('weflow-backup-inspect-')
       await tar.x({
         file: archivePath,
         cwd: extractDir,
@@ -836,12 +890,135 @@ export class BackupService {
     }
   }
 
+  private async streamRestoreArchive(
+    archivePath: string,
+    extractDir: string,
+    manifest: BackupManifest,
+    connected: { dbStorage: string; wxid?: string },
+    startCurrent: number,
+    total: number
+  ): Promise<{ current: number; skipped: number }> {
+    const snapshotPaths = new Set<string>()
+    for (const db of manifest.databases || []) {
+      for (const table of db.tables || []) {
+        const path = normalizeArchivePath(table.snapshotPath)
+        if (path) snapshotPaths.add(path)
+      }
+    }
+
+    const imageByPath = new Map<string, BackupResourceEntry>()
+    for (const image of manifest.resources?.images || []) {
+      const path = normalizeArchivePath(image.archivePath)
+      if (path) imageByPath.set(path, image)
+    }
+
+    const plainByPath = new Map<string, BackupResourceEntry>()
+    for (const resource of [
+      ...(manifest.resources?.videos || []),
+      ...(manifest.resources?.files || [])
+    ]) {
+      const path = normalizeArchivePath(resource.archivePath)
+      if (path) plainByPath.set(path, resource)
+    }
+
+    const accountDir = dirname(connected.dbStorage)
+    const imageKeys = imageByPath.size > 0
+      ? this.getImageKeysForWxid(connected.wxid || String(manifest.source?.wxid || '').trim())
+      : null
+    if (imageByPath.size > 0 && !imageKeys) {
+      throw new Error('备份包包含图片资源，但目标账号未配置图片加密密钥')
+    }
+
+    let current = startCurrent
+    let skipped = 0
+    const pending: Promise<void>[] = []
+    const emitRestoreProgress = createThrottledProgressEmitter(160)
+    await tar.t({
+      file: archivePath,
+      onReadEntry: (entry: any) => {
+        const entryPath = normalizeArchivePath(entry.path)
+        if (snapshotPaths.has(entryPath)) {
+          const outputPath = this.resolveStagingPath(extractDir, entryPath)
+          if (!outputPath) {
+            entry.resume()
+            return
+          }
+          pending.push(this.writeTarEntryToFile(entry, outputPath))
+          return
+        }
+
+        const image = imageByPath.get(entryPath)
+        if (image) {
+          const tempPath = this.resolveStagingPath(extractDir, entryPath)
+          const targetPath = this.resolveTargetResourcePath(accountDir, image.targetRelativePath)
+          if (!tempPath || !targetPath) {
+            skipped += 1
+            entry.resume()
+            return
+          }
+          const task = this.writeTarEntryToFile(entry, tempPath).then(async () => {
+            current += 1
+            emitRestoreProgress({
+              phase: 'restoring',
+              message: '正在加密并写回图片资源',
+              current,
+              total,
+              detail: image.md5 || image.targetRelativePath
+            })
+            if (existsSync(targetPath)) {
+              skipped += 1
+              return
+            }
+            const encrypted = encryptDatViaNative(tempPath, imageKeys!.xorKey, imageKeys!.aesKey, image.datMeta)
+            if (!encrypted) {
+              skipped += 1
+              return
+            }
+            mkdirSync(dirname(targetPath), { recursive: true })
+            await writeFile(targetPath, encrypted)
+          })
+          pending.push(task)
+          return
+        }
+
+        const resource = plainByPath.get(entryPath)
+        if (resource) {
+          const targetPath = this.resolveTargetResourcePath(accountDir, resource.targetRelativePath)
+          current += 1
+          emitRestoreProgress({
+            phase: 'restoring',
+            message: resource.kind === 'video' ? '正在写回视频资源' : '正在写回文件资源',
+            current,
+            total,
+            detail: resource.targetRelativePath
+          })
+          if (!targetPath || existsSync(targetPath)) {
+            skipped += 1
+            entry.resume()
+            return
+          }
+          pending.push(this.writeTarEntryToFile(entry, targetPath))
+          return
+        }
+
+        entry.resume()
+      }
+    } as any)
+
+    await Promise.all(pending)
+    return { current, skipped }
+  }
+
   async restoreBackup(archivePath: string): Promise<{ success: boolean; inserted?: number; ignored?: number; skipped?: number; error?: string }> {
     let extractDir = ''
     try {
-      emitBackupProgress({ phase: 'inspecting', message: '正在解包备份' })
-      extractDir = await mkdtemp(join(tmpdir(), 'weflow-backup-restore-'))
-      await tar.x({ file: archivePath, cwd: extractDir })
+      emitBackupProgress({ phase: 'inspecting', message: '正在读取备份信息' })
+      extractDir = await this.createTempDir('weflow-backup-restore-')
+      await tar.x({
+        file: archivePath,
+        cwd: extractDir,
+        filter: (entryPath: string) => normalizeArchivePath(entryPath) === 'manifest.json'
+      } as any)
       const manifestPath = join(extractDir, 'manifest.json')
       if (!existsSync(manifestPath)) return { success: false, error: '备份包缺少 manifest.json' }
       const manifest = JSON.parse(await readFileAsync(manifestPath, 'utf8')) as BackupManifest
@@ -866,6 +1043,26 @@ export class BackupService {
       let ignored = 0
       let skipped = 0
       let current = 0
+      if (imageJobs.length > 0 || plainResourceJobs.length > 0 || tableJobs.length > 0) {
+        emitBackupProgress({
+          phase: 'inspecting',
+          message: '正在按需读取备份包',
+          current: 0,
+          total: totalRestoreJobs,
+          detail: archivePath
+        })
+        const streamed = await this.streamRestoreArchive(
+          archivePath,
+          extractDir,
+          manifest,
+          { dbStorage: connected.dbStorage, wxid: connected.wxid },
+          0,
+          totalRestoreJobs
+        )
+        current = streamed.current
+        skipped += streamed.skipped
+      }
+
       for (const job of tableJobs) {
         current++
         const targetDbPath = this.resolveRestoreTargetDbPath(connected.dbStorage, job.db)
@@ -905,68 +1102,6 @@ export class BackupService {
         inserted += restored.inserted || 0
         ignored += restored.ignored || 0
         if (current % 4 === 0) await delay()
-      }
-
-      if (imageJobs.length > 0) {
-        const targetWxid = connected.wxid || String(manifest.source?.wxid || '').trim()
-        const imageKeys = this.getImageKeysForWxid(targetWxid)
-        if (!imageKeys) throw new Error('备份包包含图片资源，但目标账号未配置图片加密密钥')
-        const accountDir = dirname(connected.dbStorage)
-        for (const image of imageJobs) {
-          current += 1
-          emitBackupProgress({
-            phase: 'restoring',
-            message: '正在加密并写回图片资源',
-            current,
-            total: totalRestoreJobs,
-            detail: image.md5 || image.targetRelativePath
-          })
-          const inputPath = this.resolveExtractedPath(extractDir, image.archivePath)
-          const targetPath = this.resolveTargetResourcePath(accountDir, image.targetRelativePath)
-          if (!inputPath || !targetPath || !existsSync(inputPath)) {
-            skipped += 1
-            continue
-          }
-          if (existsSync(targetPath)) {
-            skipped += 1
-            continue
-          }
-          const encrypted = encryptDatViaNative(inputPath, imageKeys.xorKey, imageKeys.aesKey)
-          if (!encrypted) {
-            skipped += 1
-            continue
-          }
-          mkdirSync(dirname(targetPath), { recursive: true })
-          await writeFile(targetPath, encrypted)
-          if (current % 16 === 0) await delay()
-        }
-      }
-
-      if (plainResourceJobs.length > 0) {
-        const accountDir = dirname(connected.dbStorage)
-        for (const resource of plainResourceJobs) {
-          current += 1
-          emitBackupProgress({
-            phase: 'restoring',
-            message: resource.kind === 'video' ? '正在写回视频资源' : '正在写回文件资源',
-            current,
-            total: totalRestoreJobs,
-            detail: resource.targetRelativePath
-          })
-          const inputPath = this.resolveExtractedPath(extractDir, resource.archivePath)
-          const targetPath = this.resolveTargetResourcePath(accountDir, resource.targetRelativePath)
-          if (!inputPath || !targetPath || !existsSync(inputPath)) {
-            skipped += 1
-            continue
-          }
-          if (existsSync(targetPath)) {
-            skipped += 1
-            continue
-          }
-          mkdirSync(dirname(targetPath), { recursive: true })
-          await copyFile(inputPath, targetPath)
-          if (current % 30 === 0) await delay()
-        }
       }
 
       emitBackupProgress({ phase: 'done', message: '载入完成', current: totalRestoreJobs, total: totalRestoreJobs })
